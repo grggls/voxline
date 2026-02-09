@@ -25,7 +25,7 @@ This is a learning project. The goal is hands-on fluency with a specific tech st
 
 ## Architecture
 
-See **[VOXLINE-ARCHITECTURE.svg](VOXLINE-ARCHITECTURE.svg)** for the full system diagram with numbered hot path flow, latency targets, and cold path branches.
+![Voxline System Architecture](VOXLINE-ARCHITECTURE.svg)
 
 **Hot path (NATS):** User message → API Gateway → NATS → Intent Router → LLM Service (Qwen3 0.6B classifies, Qwen3 1.7B responds) → Response Composer → NATS → API Gateway → User. 5 NATS hops at <1ms each. Target: <500ms time-to-first-token. Full response streams token-by-token over 1-3s (CPU inference with a 1.7B model).
 
