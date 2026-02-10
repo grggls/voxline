@@ -153,22 +153,73 @@ helm install redis bitnami/redis -n voxline -f infra/helm/redis-values.yaml
 
 Create `infra/helm/deploy-infra.sh`:
 
-- Add all Helm repos (nats, bitnami)
-- `helm repo update`
-- Install/upgrade each chart with its values file into the `voxline` namespace
-- Wait for all pods to be ready
-- Create the JetStream stream `VOXLINE_EVENTS` after NATS is running:
-  ```bash
-  kubectl exec -n voxline deploy/nats -c nats -- \
-    nats stream add VOXLINE_EVENTS \
-      --subjects "voxline.events.>" \
-      --retention limits \
-      --max-msgs 10000 \
-      --max-age 24h \
-      --storage file \
-      --replicas 1 \
-      --discard old
-  ```
+```bash
+#!/bin/bash
+set -euo pipefail
+
+echo "=== Deploying Infrastructure (NATS, MongoDB, Redis) ==="
+echo ""
+
+# --- Helm repos ---
+echo "Adding Helm repos..."
+helm repo add nats https://nats-io.github.io/k8s/helm/charts/ 2>/dev/null || true
+helm repo add bitnami https://charts.bitnami.com/bitnami 2>/dev/null || true
+helm repo update
+
+# --- NATS (Core + JetStream) ---
+echo ""
+echo "Installing NATS..."
+helm upgrade --install nats nats/nats \
+  -n voxline \
+  -f infra/helm/nats-values.yaml \
+  --timeout 3m
+
+# --- MongoDB ---
+echo ""
+echo "Installing MongoDB..."
+helm upgrade --install mongodb bitnami/mongodb \
+  -n voxline \
+  -f infra/helm/mongodb-values.yaml \
+  --timeout 3m
+
+# --- Redis ---
+echo ""
+echo "Installing Redis..."
+helm upgrade --install redis bitnami/redis \
+  -n voxline \
+  -f infra/helm/redis-values.yaml \
+  --timeout 3m
+
+# --- Wait for all pods ---
+echo ""
+echo "Waiting for pods to be ready..."
+kubectl wait -n voxline --for=condition=ready pod -l app.kubernetes.io/name=nats --timeout=120s
+kubectl wait -n voxline --for=condition=ready pod -l app.kubernetes.io/name=mongodb --timeout=120s
+kubectl wait -n voxline --for=condition=ready pod -l app.kubernetes.io/name=redis --timeout=120s
+
+# --- Create JetStream stream ---
+echo ""
+echo "Creating VOXLINE_EVENTS JetStream stream..."
+kubectl exec -n voxline deploy/nats -c nats -- \
+  nats stream add VOXLINE_EVENTS \
+    --subjects "voxline.events.>" \
+    --retention limits \
+    --max-msgs 10000 \
+    --max-age 24h \
+    --storage file \
+    --replicas 1 \
+    --discard old \
+  2>/dev/null || echo "  Stream already exists (idempotent)"
+
+echo ""
+echo "=== Infrastructure Deployed ==="
+echo ""
+echo "  NATS:     nats://localhost:4222  (monitoring: http://localhost:8222)"
+echo "  MongoDB:  mongodb://localhost:27017/voxline"
+echo "  Redis:    redis://localhost:6379"
+echo ""
+echo "Next: run 'make ollama-up && make ollama-pull' to deploy Ollama and pull models."
+```
 
 ### 5. Makefile targets
 

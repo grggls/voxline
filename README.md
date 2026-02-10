@@ -95,7 +95,8 @@ This saves ~1.5 Gi RAM and significant configuration time in early milestones, l
 ### 1. API Gateway (`gateway/` — TypeScript, Node.js, Express)
 - Express server with WebSocket (via `ws` library) for real-time bidirectional streaming
 - REST endpoints for tenant config, conversation history
-- Publishes user messages to NATS, subscribes to response subjects
+- Publishes user messages to NATS, subscribes to session-scoped response subjects (`voxline.{tenantId}.{sessionId}.outbound`)
+- Sets `voxline-reply-to` header on every NATS message so downstream services know where to send responses
 - Multi-tenant: route by tenant ID, enforce rate limits via Redis
 - **Learning goals:** TypeScript service architecture with Express, WebSocket handling, NATS client integration
 
@@ -125,6 +126,7 @@ This saves ~1.5 Gi RAM and significant configuration time in early milestones, l
 
 ### 4. Response Composer (`response-composer/` — TypeScript, Node.js, Express)
 - Assembles final response from LLM output + business rules
+- Reads `voxline-reply-to` header to determine outbound subject (never constructs it directly)
 - Publishes to NATS response subject and durable event stream (JetStream in M1-M2, Kafka in M3+)
 - Writes conversation turn to MongoDB
 - **Learning goals:** NATS + durable event dual-publish pattern, MongoDB write patterns, JetStream→Kafka migration
@@ -186,9 +188,10 @@ Running the full stack in `kind` on a laptop. All numbers are for CPU-only infer
 
 | | CPU Request | CPU Limit | RAM Request | RAM Limit |
 |---|---|---|---|---|
+| **Observability** (Prometheus, Grafana, metrics-server, OTel, exporters) | 0.55 cores | 1.2 cores | 0.6 Gi | 1.2 Gi |
 | **Infrastructure** (Ollama, Mongo, NATS, Redis) | 1.45 cores | 3.0 cores | 1.4 Gi | 2.3 Gi |
 | **Application services** (6 services) | 0.55 cores | 1.35 cores | 0.7 Gi | 1.4 Gi |
-| **Total** | **2.0 cores** | **4.35 cores** | **2.1 Gi** | **3.7 Gi** |
+| **Total** | **2.55 cores** | **5.55 cores** | **2.7 Gi** | **4.9 Gi** |
 
 ### Totals (M3+, with Kafka)
 
@@ -246,13 +249,13 @@ The gateway injects this into every NATS message header. Every downstream servic
 
 **NATS — subject hierarchy:**
 ```
-voxline.{tenantId}.inbound        // gateway → intent router
-voxline.{tenantId}.intent.faq     // intent router → FAQ handler
-voxline.{tenantId}.intent.general // intent router → LLM service
-voxline.{tenantId}.llm.response   // LLM service → response composer
-voxline.{tenantId}.outbound       // response composer → gateway
+voxline.{tenantId}.inbound                  // gateway → intent router
+voxline.{tenantId}.intent.faq               // intent router → FAQ handler
+voxline.{tenantId}.intent.general           // intent router → LLM service
+voxline.{tenantId}.llm.response             // LLM service → response composer
+voxline.{tenantId}.{sessionId}.outbound     // response composer → gateway (session-scoped)
 ```
-Each service subscribes to `voxline.*.{its-subject}` for fan-in, but publishes to tenant-specific subjects. This means NATS does the routing — services don't need tenant-aware if/else logic internally, they just subscribe to the right subject patterns.
+Each service subscribes to `voxline.*.{its-subject}` for fan-in, but publishes to tenant-specific subjects. The outbound subject is **session-scoped** — each WebSocket connection subscribes to its own session-specific subject. The gateway sets a `voxline-reply-to` header on every published message containing the session's outbound subject. Downstream services never construct the outbound subject themselves — they read the `voxline-reply-to` header and publish there. This ensures two browser tabs connected as the same tenant receive only their own responses.
 
 **MongoDB — tenant field + compound indexes:**
 ```javascript
@@ -401,10 +404,14 @@ const requestId = `req_${Date.now()}_${randomBytes(4).toString('hex')}`;
 // NATS headers on every message
 {
   'voxline-tenant-id': tenantId,
+  'voxline-session-id': sessionId,
   'voxline-request-id': requestId,
-  'voxline-timestamp': Date.now().toString()
+  'voxline-timestamp': Date.now().toString(),
+  'voxline-reply-to': `voxline.${tenantId}.${sessionId}.outbound`
 }
 ```
+
+The `voxline-reply-to` header tells the final service in the pipeline where to publish the response. Intermediate services pass it through unchanged. This decouples the responding service from knowing the outbound subject construction logic.
 
 **Every service logs it with a timestamp:**
 ```typescript
@@ -552,6 +559,39 @@ Deciding what happens on failure is itself a learning goal. The current design i
 | **MongoDB slow** | Context loading delayed; writes delayed | Hot path reads: LLM Service falls back to no-context response (degrade gracefully, don't block). Cold path writes: fire-and-forget, log failure, continue | MongoDB is not on the critical hot path if context is pre-fetched via NATS headers |
 | **Redis unavailable** | Rate limiting disabled, cache miss, session loss | Gateway: skip rate limit check (fail open), skip cache check, proceed without session state. Log warning | Fail-open is correct for a learning project — better to serve than to block |
 | **Event stream failure** (JetStream/Kafka) | Analytics gap | Response Composer: fire-and-forget, log the failure, continue hot path. Analytics worker: consumer reconnects automatically | Cold path failures are explicitly non-blocking |
+
+## WebSocket Error Frame Protocol
+
+All WebSocket messages from the gateway follow one of two formats:
+
+```typescript
+// Success frame — normal response
+{
+  type: 'message',
+  content: string,              // response text
+  requestId: string,            // correlation ID
+  timestamps: TimestampEntry[], // hop-by-hop trace
+}
+
+// Error frame — something went wrong
+{
+  type: 'error',
+  code: string,                 // machine-readable error code
+  message: string,              // human-readable description
+  requestId?: string,           // present if error is request-scoped
+}
+```
+
+**Error codes:**
+
+| Code | Trigger | Description |
+|---|---|---|
+| `RATE_LIMITED` | Redis sliding window exceeded | Tenant has exceeded their rate limit |
+| `SERVICE_UNAVAILABLE` | NATS/Ollama down, circuit open | Backend service is temporarily unavailable |
+| `STREAM_ERROR` | Ollama dies mid-stream | LLM response was interrupted |
+| `INTERNAL_ERROR` | Unhandled exception in message processing | Unexpected server error |
+
+The gateway sends error frames instead of silently dropping errors. Downstream services (Response Composer, LLM Service) can publish error payloads with `type: 'error'` to the outbound subject, and the gateway forwards them as error frames to the WebSocket client.
 
 ## Testing Strategy
 

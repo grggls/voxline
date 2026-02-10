@@ -221,17 +221,24 @@ export function setupWebSocket(wss: WebSocketServer): void {
       for await (const msg of sub) {
         try {
           const payload = JSON.parse(msg.string()) as VoxlineMessage;
-          // Forward message or error frames to the WebSocket client
-          ws.send(JSON.stringify({
-            type: payload.metadata?.error ? 'error' : 'message',
-            content: payload.content,
-            requestId: payload.tenantContext.requestId,
-            timestamps: payload.timestamps,
-            ...(payload.metadata?.error ? {
-              code: payload.metadata.code,
-              message: payload.metadata.message,
-            } : {}),
-          }));
+
+          // Downstream services set type: 'error' for error frames (e.g., Ollama dies mid-stream).
+          // The gateway transforms these into WebSocket error frames per the error frame protocol.
+          if (payload.type === 'error') {
+            ws.send(JSON.stringify({
+              type: 'error',
+              code: payload.metadata?.code ?? 'UNKNOWN',
+              message: payload.metadata?.message ?? payload.content,
+              requestId: payload.tenantContext.requestId,
+            }));
+          } else {
+            ws.send(JSON.stringify({
+              type: 'message',
+              content: payload.content,
+              requestId: payload.tenantContext.requestId,
+              timestamps: payload.timestamps,
+            }));
+          }
         } catch (err) {
           logger.error('ws.forward.error', err);
         }
@@ -311,8 +318,16 @@ async function main() {
   const app = express();
   app.use(express.json());
 
-  // Deep health check — returns 200 when all deps are healthy, 503 when degraded.
+  // Liveness check — returns 200 if the process is running.
+  // Does NOT check dependencies. Prevents Kubernetes from restarting the pod
+  // when a dependency (e.g., Redis) is temporarily down.
+  app.get('/livez', (_req, res) => {
+    res.status(200).json({ status: 'ok' });
+  });
+
+  // Readiness check — returns 200 when all deps are healthy, 503 when degraded.
   // No I/O on the probe path — reads event-driven booleans from connections.ts.
+  // Used by readiness probe to stop routing traffic when deps are unhealthy.
   app.get('/health', (_req, res) => {
     const deps = getHealth();
     const allHealthy = deps.nats && deps.mongodb && deps.redis;
@@ -473,7 +488,7 @@ spec:
             failureThreshold: 3
           livenessProbe:
             httpGet:
-              path: /health
+              path: /livez
               port: 3000
             initialDelaySeconds: 10
             periodSeconds: 10
@@ -533,6 +548,13 @@ spec:
                 name: gateway
                 port:
                   number: 3000
+          - path: /livez
+            pathType: Exact
+            backend:
+              service:
+                name: gateway
+                port:
+                  number: 3000
 ```
 
 ### 11. Build and load script
@@ -572,13 +594,19 @@ gateway-deploy: gateway-build
    # Should be Running
    ```
 
-4. **Health check responds:**
+4. **Health check responds (readiness):**
    ```bash
    curl http://localhost:8080/health
-   # Should return {"status":"ok","service":"gateway"}
+   # Should return {"status":"ok","service":"gateway","dependencies":{"nats":true,"mongodb":true,"redis":true}}
    ```
 
-5. **WebSocket connects with tenantId:**
+5. **Liveness check responds (always 200):**
+   ```bash
+   curl http://localhost:8080/livez
+   # Should return {"status":"ok"} — always 200, does not check dependencies
+   ```
+
+6. **WebSocket connects with tenantId:**
    ```bash
    # Requires tenant in MongoDB — see prompt-m1-07
    # After seeding, test with wscat:
@@ -586,13 +614,13 @@ gateway-deploy: gateway-build
    # Should connect (not close with error)
    ```
 
-6. **WebSocket rejects missing tenantId:**
+7. **WebSocket rejects missing tenantId:**
    ```bash
    npx wscat -c "ws://localhost:8080/ws"
    # Should close with code 4001
    ```
 
-7. **Structured logs contain requestId:**
+8. **Structured logs contain requestId:**
    ```bash
    kubectl logs -n voxline deployment/gateway | head -5
    # Each line should be valid JSON with service, event, ts fields

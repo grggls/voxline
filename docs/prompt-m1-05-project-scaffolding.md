@@ -54,6 +54,9 @@ tsconfig.base.json             # Shared TypeScript config
     "test:m1": "npm test -w tests -- --testPathPattern=m1/",
     "lint": "eslint ."
   },
+  "engines": {
+    "node": ">=18"
+  },
   "devDependencies": {
     "typescript": "^5.9",
     "eslint": "^9",
@@ -112,9 +115,11 @@ export interface TimestampEntry {
 
 /**
  * Standard NATS message payload for the Voxline pipeline.
+ * type defaults to 'message'. Downstream services set type: 'error' for error frames.
  */
 export interface VoxlineMessage {
   tenantContext: TenantContext;
+  type?: 'message' | 'error';
   content: string;
   timestamps: TimestampEntry[];
   metadata?: Record<string, unknown>;
@@ -381,7 +386,7 @@ describe('TenantContext NATS header round-trip', () => {
 
 ### 11. ESLint flat config
 
-Create `eslint.config.js` in the project root. ESLint 9 requires flat config — `.eslintrc` is no longer supported:
+Create `eslint.config.mjs` in the project root. ESLint 9 requires flat config — `.eslintrc` is no longer supported. The `.mjs` extension is required because the root `package.json` does not have `"type": "module"`, and this config uses ESM `import` syntax:
 
 ```javascript
 import eslint from '@eslint/js';
@@ -395,8 +400,6 @@ export default tseslint.config(
   },
 );
 ```
-
-**Note:** The root `package.json` does not have `"type": "module"`, so you may need to use `eslint.config.mjs` instead of `eslint.config.js` if ESM import syntax fails.
 
 ### 12. Jest configuration for shared package
 

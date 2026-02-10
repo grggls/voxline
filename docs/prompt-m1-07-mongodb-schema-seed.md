@@ -15,8 +15,7 @@ Create `infra/mongodb/init-db.js` — a `mongosh` script that creates collection
 ```javascript
 // infra/mongodb/init-db.js
 // Run with: mongosh mongodb://mongodb.voxline.svc.cluster.local:27017/voxline < init-db.js
-
-const db = db.getSiblingDB('voxline');
+// The connection string targets /voxline, so `db` is already the voxline database.
 
 // ===== COLLECTIONS =====
 

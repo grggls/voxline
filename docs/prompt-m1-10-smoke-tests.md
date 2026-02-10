@@ -537,6 +537,48 @@ describe('M1 Smoke Tests', () => {
 
       client.close();
     });
+
+    test('gateway forwards error frames published to session outbound subject', async () => {
+      // Subscribe to inbound to intercept the reply-to header
+      const inboundSub = nats.subscribe('voxline.acme.inbound', { max: 1 });
+
+      const client = new TestWsClient();
+      await client.connect('acme');
+      client.send('error forwarding test');
+
+      // Read the inbound NATS message to extract the session's reply-to subject
+      let replyTo = '';
+      for await (const msg of inboundSub) {
+        if (msg.headers) {
+          for (const [key, values] of msg.headers) {
+            if (key === 'voxline-reply-to') replyTo = values[0];
+          }
+        }
+      }
+      expect(replyTo).toMatch(/^voxline\.acme\..+\.outbound$/);
+
+      // Consume the normal echo response first
+      const echoResp = await client.waitForMessage();
+      expect(echoResp.type).toBe('message');
+
+      // Publish an error frame directly to the session's outbound subject.
+      // The gateway should detect type: 'error' and forward as a WebSocket error frame.
+      const errorPayload = {
+        tenantContext: { tenantId: 'acme', sessionId: 'test', requestId: 'req_err_test', timestamp: Date.now() },
+        type: 'error',
+        content: 'Service unavailable',
+        timestamps: [],
+        metadata: { code: 'SERVICE_UNAVAILABLE', message: 'Ollama is down' },
+      };
+      nats.publish(replyTo, JSON.stringify(errorPayload));
+
+      // Gateway should forward as a WebSocket error frame
+      const errorResp = await client.waitForMessage();
+      expect(errorResp.type).toBe('error');
+      expect(errorResp.code).toBe('SERVICE_UNAVAILABLE');
+
+      client.close();
+    });
   });
 
   // ----- TEST 8: Gateway Health Endpoint -----
@@ -552,6 +594,16 @@ describe('M1 Smoke Tests', () => {
       expect(body.dependencies.nats).toBe(true);
       expect(body.dependencies.mongodb).toBe(true);
       expect(body.dependencies.redis).toBe(true);
+    });
+
+    test('livez endpoint returns 200 unconditionally', async () => {
+      const res = await fetch('http://localhost:8080/livez');
+      expect(res.ok).toBe(true);
+
+      const body = await res.json() as any;
+      expect(body.status).toBe('ok');
+      // livez must NOT include dependency checks — it's for liveness only
+      expect(body.dependencies).toBeUndefined();
     });
   });
 
@@ -625,15 +677,19 @@ describe('M1 Smoke Tests', () => {
     test('compound indexes exist on conversations collection', async () => {
       const db = await getMongoDb();
       const indexes = await db.collection('conversations').indexes();
-      const indexKeys = indexes.map((i) => Object.keys(i.key));
 
-      // Should have tenant+session+timestamp compound index
-      const hasCompound = indexKeys.some(
-        (keys) =>
+      // Verify the tenant+session+timestamp compound index exists.
+      // Key ORDER matters for compound indexes — tenantId must be first (prefix key),
+      // sessionId second, timestamp third. MongoDB preserves key order in index specs.
+      const hasCompound = indexes.some((idx) => {
+        const keys = Object.keys(idx.key);
+        return (
+          keys.length >= 3 &&
           keys[0] === 'tenantId' &&
-          keys.includes('sessionId') &&
-          keys.includes('timestamp')
-      );
+          keys[1] === 'sessionId' &&
+          keys[2] === 'timestamp'
+        );
+      });
       expect(hasCompound).toBe(true);
     });
   });
@@ -717,8 +773,10 @@ make test-m1
       ✓ connection receives HTTP 101 upgrade
     Error frames
       ✓ malformed message returns error frame
+      ✓ gateway forwards error frames published to session outbound subject
     Gateway health
       ✓ health endpoint reports dependency status
+      ✓ livez endpoint returns 200 unconditionally
     NATS subject hierarchy
       ✓ messages are published to tenant-scoped inbound subjects
     JetStream VOXLINE_EVENTS stream
@@ -732,7 +790,7 @@ make test-m1
     Ollama accessibility
       ✓ Ollama API responds with model list
 
-Tests:       18 passed, 18 total
+Tests:       20 passed, 20 total
 ```
 
 ## Known Risks
@@ -752,7 +810,7 @@ Tests:       18 passed, 18 total
 
 ## M1 Completion
 
-When all 18 smoke tests pass, **M1 is complete**. The foundation is proven:
+When all 20 smoke tests pass, **M1 is complete**. The foundation is proven:
 - Kind cluster with all infrastructure running
 - NATS pub/sub with tenant-scoped subjects
 - JetStream stream for cold path

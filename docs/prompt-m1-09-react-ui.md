@@ -44,11 +44,12 @@ ui/
 ```typescript
 export interface Message {
   id: string;
-  role: 'user' | 'assistant';
+  role: 'user' | 'assistant' | 'error';
   content: string;
   requestId?: string;
   timestamps?: Array<{ service: string; event: string; ts: number }>;
   receivedAt?: number;
+  errorCode?: string;
 }
 
 export interface WebSocketResponse {
@@ -56,6 +57,13 @@ export interface WebSocketResponse {
   content: string;
   requestId: string;
   timestamps: Array<{ service: string; event: string; ts: number }>;
+}
+
+export interface WebSocketErrorResponse {
+  type: 'error';
+  code: string;
+  message: string;
+  requestId: string;
 }
 ```
 
@@ -65,7 +73,7 @@ Custom hook that manages the WebSocket connection lifecycle:
 
 ```typescript
 import { useRef, useState, useCallback, useEffect } from 'react';
-import { Message, WebSocketResponse } from '../types';
+import { Message, WebSocketResponse, WebSocketErrorResponse } from '../types';
 
 export function useWebSocket(tenantId: string | null) {
   const wsRef = useRef<WebSocket | null>(null);
@@ -88,18 +96,34 @@ export function useWebSocket(tenantId: string | null) {
 
     ws.onmessage = (event) => {
       try {
-        const data: WebSocketResponse = JSON.parse(event.data);
-        setMessages((prev) => [
-          ...prev,
-          {
-            id: data.requestId || crypto.randomUUID(),
-            role: 'assistant',
-            content: data.content,
-            requestId: data.requestId,
-            timestamps: data.timestamps,
-            receivedAt: Date.now(),
-          },
-        ]);
+        const data: WebSocketResponse | WebSocketErrorResponse = JSON.parse(event.data);
+        if (data.type === 'error') {
+          const err = data as WebSocketErrorResponse;
+          setMessages((prev) => [
+            ...prev,
+            {
+              id: err.requestId || crypto.randomUUID(),
+              role: 'error',
+              content: err.message || 'Unknown error',
+              requestId: err.requestId,
+              errorCode: err.code,
+              receivedAt: Date.now(),
+            },
+          ]);
+        } else {
+          const msg = data as WebSocketResponse;
+          setMessages((prev) => [
+            ...prev,
+            {
+              id: msg.requestId || crypto.randomUUID(),
+              role: 'assistant',
+              content: msg.content,
+              requestId: msg.requestId,
+              timestamps: msg.timestamps,
+              receivedAt: Date.now(),
+            },
+          ]);
+        }
       } catch {
         // Ignore unparseable messages
       }
@@ -209,10 +233,26 @@ export function MessageList({ messages }: Props) {
               maxWidth: '70%',
               padding: '8px 12px',
               borderRadius: 8,
-              background: msg.role === 'user' ? '#3B82F6' : '#F1F5F9',
-              color: msg.role === 'user' ? 'white' : 'black',
+              background:
+                msg.role === 'user'
+                  ? '#3B82F6'
+                  : msg.role === 'error'
+                    ? '#FEE2E2'
+                    : '#F1F5F9',
+              color:
+                msg.role === 'user'
+                  ? 'white'
+                  : msg.role === 'error'
+                    ? '#991B1B'
+                    : 'black',
+              border: msg.role === 'error' ? '1px solid #FECACA' : 'none',
             }}
           >
+            {msg.role === 'error' && (
+              <div style={{ fontWeight: 'bold', fontSize: 12, marginBottom: 4 }}>
+                Error: {msg.errorCode ?? 'UNKNOWN'}
+              </div>
+            )}
             {msg.content}
           </div>
           {msg.timestamps && msg.timestamps.length > 0 && (
@@ -374,6 +414,18 @@ spec:
             limits:
               cpu: 100m
               memory: 128Mi
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 80
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 80
+            initialDelaySeconds: 2
+            periodSeconds: 5
 ---
 apiVersion: v1
 kind: Service
@@ -491,6 +543,16 @@ Then replace the generated `App.tsx`, `main.tsx`, and add the components/hooks l
    Tab 1: Acme — send "acme msg"
    Tab 2: Globex — send "globex msg"
    Verify no cross-talk between tabs
+   ```
+
+9. **Error frames display with red styling:**
+   ```
+   If a downstream service publishes a type: 'error' frame to the session outbound subject,
+   the UI should render it left-aligned with:
+     - Red background (#FEE2E2), dark red text (#991B1B)
+     - Bold "Error: CODE" header above the message content
+     - No timestamp/hop info (error frames don't carry timestamps)
+   This is tested automatically by the m1-10 smoke test for error frame forwarding.
    ```
 
 ## Known Risks
