@@ -1,0 +1,21 @@
+# bitnami/redis chart — Cache layer for Voxline
+# Session state, LLM response caching, rate limiting
+architecture: standalone
+auth:
+  enabled: false
+master:
+  resources:
+    requests:
+      cpu: 100m
+      memory: 64Mi
+    limits:
+      cpu: 250m
+      memory: 128Mi
+  persistence:
+    size: 1Gi
+  service:
+    type: NodePort
+    nodePorts:
+      redis: "30379"
+replica:
+  replicaCount: 0

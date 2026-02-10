@@ -1,7 +1,8 @@
 CLUSTER_NAME := voxline
 
 .PHONY: cluster-up cluster-down cluster-stop cluster-start cluster-status \
-       foundations-up foundations-down foundations-status
+       foundations-up foundations-down foundations-status \
+       infra-up infra-down infra-status
 
 cluster-up:
 	@bash infra/kind/create-cluster.sh
@@ -57,3 +58,18 @@ foundations-status:
 	@echo "--- Grafana ---"
 	@echo "  URL: http://localhost:30000"
 	@echo "  Credentials: admin / voxline"
+
+# === Infrastructure (NATS, MongoDB, Redis) ===
+
+infra-up:
+	@bash infra/helm/deploy-infra.sh
+
+infra-down:
+	helm uninstall nats mongodb redis -n voxline || true
+
+infra-status:
+	@echo "=== Infrastructure Status ==="
+	@echo ""
+	@kubectl get pods -n voxline
+	@echo ""
+	@kubectl get pvc -n voxline

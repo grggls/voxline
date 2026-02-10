@@ -1,0 +1,22 @@
+# bitnami/mongodb chart — Document store for Voxline
+# Conversation state, session management, tenant config, analytics
+architecture: standalone
+auth:
+  enabled: false
+resources:
+  requests:
+    cpu: 250m
+    memory: 256Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+persistence:
+  size: 2Gi
+# Cap WiredTiger cache to 256MB
+extraEnvVars:
+  - name: MONGODB_EXTRA_FLAGS
+    value: "--wiredTigerCacheSizeGB=0.25"
+service:
+  type: NodePort
+  nodePorts:
+    mongodb: 30017

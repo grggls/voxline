@@ -1,0 +1,47 @@
+# nats-io/nats chart — Core NATS + JetStream for Voxline
+# Hot path: Core NATS (sub-millisecond pub/sub, no persistence overhead)
+# Cold path: JetStream (durable VOXLINE_EVENTS stream, M1-M2)
+config:
+  jetstream:
+    enabled: true
+    fileStore:
+      enabled: true
+      dir: /data
+      pvc:
+        enabled: true
+        size: 1Gi
+    memoryStore:
+      enabled: true
+      maxSize: 64Mi
+  monitor:
+    enabled: true
+    port: 8222
+
+container:
+  resources:
+    requests:
+      cpu: 100m
+      memory: 64Mi
+    limits:
+      cpu: 250m
+      memory: 128Mi
+
+service:
+  ports:
+    nats:
+      enabled: true
+    monitor:
+      enabled: true
+  merge:
+    spec:
+      type: NodePort
+      ports:
+        - name: nats
+          port: 4222
+          nodePort: 30422
+        - name: monitor
+          port: 8222
+          nodePort: 30822
+
+# Monitoring NodePort exposed via service.ports.monitor + merge above
+extraResources: []

@@ -25,16 +25,22 @@ Create `infra/helm/nats-values.yaml`:
 
 ```yaml
 # nats-io/nats chart
-nats:
+config:
   jetstream:
     enabled: true
-    memStorage:
+    fileStore:
       enabled: true
-      size: 64Mi
-    fileStorage:
+      dir: /data
+      pvc:
+        enabled: true
+        size: 1Gi
+    memoryStore:
       enabled: true
-      size: 1Gi
-      storageDirectory: /data/jetstream
+      maxSize: 64Mi
+  monitor:
+    enabled: true
+    port: 8222
+container:
   resources:
     requests:
       cpu: 100m
@@ -45,31 +51,20 @@ nats:
 service:
   ports:
     nats:
-      nodePort: 30422              # Accessible at nats://localhost:4222
+      enabled: true
+    monitor:
+      enabled: true
   merge:
     spec:
       type: NodePort
-# Expose NATS monitoring HTTP endpoint
-config:
-  monitor:
-    enabled: true
-    port: 8222
-  http_port: 8222
-# Monitoring NodePort service (separate from client port)
-extraResources:
-  - apiVersion: v1
-    kind: Service
-    metadata:
-      name: nats-monitoring
-      namespace: voxline
-    spec:
-      type: NodePort
-      selector:
-        app.kubernetes.io/name: nats
       ports:
-        - port: 8222
-          targetPort: 8222
-          nodePort: 30822            # Accessible at http://localhost:8222
+        - name: nats
+          port: 4222
+          nodePort: 30422          # Accessible at nats://localhost:4222
+        - name: monitor
+          port: 8222
+          nodePort: 30822          # Accessible at http://localhost:8222
+extraResources: []
 ```
 
 Key decisions:
@@ -107,7 +102,7 @@ extraEnvVars:
     value: "--wiredTigerCacheSizeGB=0.25"
 service:
   type: NodePort
-  nodePortsExtra:
+  nodePorts:
     mongodb: 30017                 # Accessible at mongodb://localhost:27017
 ```
 
@@ -139,7 +134,7 @@ master:
   service:
     type: NodePort
     nodePorts:
-      redis: 30379                 # Accessible at redis://localhost:6379
+      redis: "30379"               # Accessible at redis://localhost:6379 (must be string, not int)
 replica:
   replicaCount: 0         # No replicas for local dev
 ```
@@ -200,7 +195,7 @@ kubectl wait -n voxline --for=condition=ready pod -l app.kubernetes.io/name=redi
 # --- Create JetStream stream ---
 echo ""
 echo "Creating VOXLINE_EVENTS JetStream stream..."
-kubectl exec -n voxline deploy/nats -c nats -- \
+kubectl exec -n voxline deploy/nats-box -- \
   nats stream add VOXLINE_EVENTS \
     --subjects "voxline.events.>" \
     --retention limits \
@@ -209,6 +204,7 @@ kubectl exec -n voxline deploy/nats -c nats -- \
     --storage file \
     --replicas 1 \
     --discard old \
+    --defaults \
   2>/dev/null || echo "  Stream already exists (idempotent)"
 
 echo ""
@@ -265,9 +261,11 @@ Run these checks after all charts are deployed:
 
 2. **NATS connectivity (from host):**
    ```bash
-   # Requires nats CLI installed locally
-   nats server info --server nats://localhost:4222
-   # Should show server info with JetStream enabled
+   # Requires nats CLI installed locally (brew tap nats-io/nats-tools && brew install nats-io/nats-tools/nats)
+   # Note: `nats server info` requires system account privileges and won't work here.
+   # Use `nats account info` instead — shows connectivity, JetStream status, and stream count.
+   nats account info --server nats://localhost:4222
+   # Should show Account: $G, JetStream enabled, Streams: 1
    ```
 
 3. **NATS monitoring (from host):**
@@ -278,7 +276,7 @@ Run these checks after all charts are deployed:
 
 4. **NATS JetStream stream exists:**
    ```bash
-   kubectl exec -n voxline deploy/nats -c nats -- nats stream info VOXLINE_EVENTS
+   kubectl exec -n voxline deploy/nats-box -- nats stream info VOXLINE_EVENTS
    # Should show stream configuration
    ```
 
@@ -303,13 +301,13 @@ Run these checks after all charts are deployed:
 8. **Persistence survives restart:**
    ```bash
    # Write test data to MongoDB
-   kubectl exec -n voxline deploy/mongodb -- mongosh --eval "db.test.insertOne({x:1})"
+   kubectl exec -n voxline deploy/mongodb -- mongosh --quiet --eval "db.test.insertOne({x:1})"
    # Restart the pod
    kubectl delete pod -n voxline -l app.kubernetes.io/name=mongodb
    # Wait for pod to come back
    kubectl wait -n voxline --for=condition=ready pod -l app.kubernetes.io/name=mongodb --timeout=60s
    # Verify data survived
-   kubectl exec -n voxline deploy/mongodb -- mongosh --eval "db.test.find()"
+   kubectl exec -n voxline deploy/mongodb -- mongosh --quiet --eval "db.test.find()"
    # Should show {x:1}
    ```
 
@@ -319,8 +317,22 @@ Run these checks after all charts are deployed:
 |---|---|
 | Bitnami chart defaults too heavy for `kind` | All values files explicitly set `resources`, `auth.enabled: false`, `persistence.size`. Test each chart individually before combining |
 | PVC stuck in Pending | Verify `kind` has a default StorageClass: `kubectl get sc`. Should show `standard (default)` |
-| NATS JetStream not enabled | Verify with `nats server info` — look for `jetstream: enabled` in output |
+| NATS JetStream not enabled | Verify with `nats account info --server nats://localhost:4222` — look for JetStream section with stream count. Or `curl -s localhost:8222/jsz` — `"disabled": true` means JetStream is off |
 | MongoDB auth blocks connections | `auth.enabled: false` in values. If accidentally left on, password is in a Secret: `kubectl get secret -n voxline` |
+| **NATS chart schema differs from examples online** | The `nats-io/nats` chart uses `config.jetstream.enabled`, `config.jetstream.fileStore`, `container.resources` — not the `nats.jetstream` / `nats.resources` pattern found in older docs. JetStream can deploy silently disabled if the wrong keys are used. Always run `helm show values nats/nats` to verify the schema, and check `curl -s localhost:8222/jsz` after deploy — if `"disabled": true`, the values are wrong. Requires uninstall + reinstall (not upgrade) because StatefulSet PVC spec changes are forbidden on upgrade |
+| **Bitnami chart schema type strictness** | Bitnami charts validate value types strictly. NodePort values like `nodePorts.redis` must be strings (`"30379"`), not integers (`30379`). Helm install fails with a clear schema error — fix is to quote the value |
+| **`nats` CLI not in NATS server container** | The `nats` CLI binary is in the `nats-box` sidecar pod, not the main NATS container. Use `kubectl exec deploy/nats-box --` for stream operations, not `kubectl exec deploy/nats -c nats --` |
+| **`nats server info` requires system privileges** | The `nats server info` and `nats server ping` commands require system account access. Use `nats account info --server nats://localhost:4222` instead for connectivity and JetStream validation from the host |
+
+## Implementation Notes (post-deploy)
+
+The prompt's values files needed ~10 minutes of tuning to match the actual chart schemas. Three fixes were required:
+
+1. **NATS chart schema mismatch.** The `nats-io/nats` chart uses `config.jetstream.enabled`, `config.jetstream.fileStore`, `config.jetstream.memoryStore`, and `container.resources` — not the `nats.jetstream` / `nats.resources` structure originally specified. The monitoring port is exposed via `service.ports.monitor.enabled: true` + `service.merge` for NodePort assignment, not via a separate `extraResources` Service. The original values deployed NATS but with JetStream silently disabled (`"disabled": true` in `/jsz`). Required uninstall + reinstall since the StatefulSet spec (JetStream PVC) can't be changed via upgrade.
+
+2. **Redis nodePort type.** The Bitnami Redis chart schema validates `nodePorts.redis` as a string, not a number. `redis: 30379` fails; `redis: "30379"` works.
+
+3. **NATS CLI location.** The `nats` CLI binary is in the `nats-box` pod (`deploy/nats-box`), not in the main NATS container. The deploy script's stream creation command needs `kubectl exec -n voxline deploy/nats-box --` not `kubectl exec -n voxline deploy/nats -c nats --`.
 
 ## Dependencies
 

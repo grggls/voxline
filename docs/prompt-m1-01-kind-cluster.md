@@ -370,9 +370,12 @@ curl -s http://localhost:8080/health                    # Gateway
 
 ## Dependencies
 
-- `kind` CLI installed
-- `kubectl` CLI installed
-- `helm` CLI installed
+- `kind` CLI installed (`brew install kind`)
+- `kubectl` CLI installed (`brew install kubectl`)
+- `helm` CLI installed (`brew install helm`)
+- `nats` CLI installed (`brew tap nats-io/nats-tools && brew install nats-io/nats-tools/nats`) — used from M1-03 onward for NATS/JetStream validation
+- `mongosh` CLI installed (`brew install mongosh`) — used from M1-03 onward for MongoDB validation
+- `redis-cli` installed (`brew install redis`) — used from M1-03 onward for Redis validation
 - Docker daemon running
 
 ## Next Step
