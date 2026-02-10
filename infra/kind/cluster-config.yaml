@@ -1,0 +1,42 @@
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+  - role: control-plane
+    kubeadmConfigPatches:
+      - |
+        kind: InitConfiguration
+        nodeRegistration:
+          kubeletExtraArgs:
+            node-labels: "ingress-ready=true"
+    extraPortMappings:
+      # --- Ingress (nginx binds to 80/443 via hostPort) ---
+      - containerPort: 80
+        hostPort: 8080
+        protocol: TCP
+      - containerPort: 443
+        hostPort: 8443
+        protocol: TCP
+      # --- Observability ---
+      - containerPort: 30000       # Grafana
+        hostPort: 30000
+        protocol: TCP
+      - containerPort: 30090       # Prometheus
+        hostPort: 9090
+        protocol: TCP
+      # --- Infrastructure ---
+      - containerPort: 30422       # NATS client
+        hostPort: 4222
+        protocol: TCP
+      - containerPort: 30822       # NATS monitoring
+        hostPort: 8222
+        protocol: TCP
+      - containerPort: 30017       # MongoDB
+        hostPort: 27017
+        protocol: TCP
+      - containerPort: 30379       # Redis
+        hostPort: 6379
+        protocol: TCP
+      # --- AI ---
+      - containerPort: 30434       # Ollama API
+        hostPort: 11434
+        protocol: TCP
