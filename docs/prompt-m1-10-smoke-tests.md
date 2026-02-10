@@ -13,8 +13,13 @@ From the PRD:
 2. Request tracing — `requestId` propagates through all hops with timestamps
 3. Tenant context extraction/injection round-trip (unit test — already in prompt-m1-05)
 4. Multi-tenant isolation (no cross-talk between tenants)
-5. JetStream stream `VOXLINE_EVENTS` exists and accepts publishes
-6. All infrastructure accessible (NATS, MongoDB, Redis, Ollama)
+5. Session isolation (same tenant, different sessions — no fan-out)
+6. WebSocket close codes (4001 missing tenantId, 4002 unknown tenant)
+7. WebSocket upgrade through Ingress (HTTP 101)
+8. Error frames (malformed message returns structured error)
+9. Gateway deep health endpoint (reports dependency status)
+10. JetStream stream `VOXLINE_EVENTS` exists and accepts publishes
+11. All infrastructure accessible (NATS, MongoDB, Redis, Ollama)
 
 ## What to Build
 
@@ -78,26 +83,57 @@ A test helper that wraps WebSocket for cleaner test assertions:
 
 ```typescript
 import WebSocket from 'ws';
+import { IncomingMessage } from 'http';
 
 export interface WsMessage {
   type: string;
-  content: string;
+  content?: string;
   requestId?: string;
   timestamps?: Array<{ service: string; event: string; ts: number }>;
+  code?: string;       // Error frame: machine-readable error code
+  message?: string;    // Error frame: human-readable error message
 }
 
 export class TestWsClient {
   private ws: WebSocket | null = null;
   private messageQueue: WsMessage[] = [];
   private resolvers: Array<(msg: WsMessage) => void> = [];
+  private _closeEvent: { code: number; reason: string } | null = null;
+  private _upgradeResponse: IncomingMessage | null = null;
 
   constructor(private baseUrl: string = 'ws://localhost:8080/ws') {}
 
+  /**
+   * Connect to the WebSocket server.
+   * Includes a 500ms grace period after 'open' to catch server-initiated closes
+   * (e.g., unknown tenant lookup that closes the connection after async validation).
+   */
   async connect(tenantId: string): Promise<void> {
     return new Promise((resolve, reject) => {
       this.ws = new WebSocket(`${this.baseUrl}?tenantId=${tenantId}`);
-      this.ws.on('open', () => resolve());
+
+      this.ws.on('upgrade', (response: IncomingMessage) => {
+        this._upgradeResponse = response;
+      });
+
+      this.ws.on('open', () => {
+        // Grace period: wait 500ms to see if the server closes us
+        // (tenant validation is async — server may close after open)
+        setTimeout(() => {
+          if (this.ws?.readyState === WebSocket.OPEN) {
+            resolve();
+          }
+          // If already closed, the 'close' handler will have called reject
+        }, 500);
+      });
+
+      this.ws.on('close', (code: number, reason: Buffer) => {
+        this._closeEvent = { code, reason: reason.toString() };
+        reject(new Error(`WebSocket closed: ${code} ${reason}`));
+      });
+
       this.ws.on('error', (err) => reject(err));
+
       this.ws.on('message', (data: Buffer) => {
         try {
           const msg = JSON.parse(data.toString()) as WsMessage;
@@ -120,6 +156,14 @@ export class TestWsClient {
     this.ws.send(JSON.stringify({ content }));
   }
 
+  /** Send raw string (for malformed message testing) */
+  sendRaw(data: string): void {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      throw new Error('WebSocket not connected');
+    }
+    this.ws.send(data);
+  }
+
   /** Wait for the next incoming message, with timeout */
   async waitForMessage(timeoutMs: number = 10000): Promise<WsMessage> {
     if (this.messageQueue.length > 0) {
@@ -132,6 +176,40 @@ export class TestWsClient {
         resolve(msg);
       });
     });
+  }
+
+  /**
+   * Assert that no more messages arrive within the given window.
+   * Used to verify tenant/session isolation — ensures no fan-out leaks.
+   */
+  async expectNoMoreMessages(windowMs: number = 2000): Promise<void> {
+    const unexpected: WsMessage[] = [];
+    await new Promise<void>((resolve) => {
+      const timer = setTimeout(() => resolve(), windowMs);
+      this.resolvers.push((msg) => {
+        clearTimeout(timer);
+        unexpected.push(msg);
+        resolve();
+      });
+    });
+    if (unexpected.length > 0) {
+      throw new Error(`Expected no more messages but received ${unexpected.length}: ${JSON.stringify(unexpected)}`);
+    }
+  }
+
+  /** Number of messages already in the queue (not yet consumed by waitForMessage) */
+  get pendingMessageCount(): number {
+    return this.messageQueue.length;
+  }
+
+  /** Close event from the server (code + reason). Available after close. */
+  get closeEvent(): { code: number; reason: string } | null {
+    return this._closeEvent;
+  }
+
+  /** HTTP upgrade response. Available after successful connection. */
+  get upgradeResponse(): IncomingMessage | null {
+    return this._upgradeResponse;
   }
 
   close(): void {
@@ -203,6 +281,8 @@ export async function closeRedis(): Promise<void> {
 Global setup that verifies infrastructure is reachable before running tests. All services are accessible via NodePort on localhost — no port-forwards needed.
 
 ```typescript
+import { connect } from '@nats-io/transport-node';
+
 export default async function globalSetup() {
   console.log('\n=== M1 Smoke Tests: Verifying Infrastructure ===\n');
 
@@ -210,6 +290,7 @@ export default async function globalSetup() {
   // No kubectl port-forward needed. See prompt-m1-01 Endpoint Reference table.
   const checks = [
     { name: 'Gateway health', url: 'http://localhost:8080/health' },
+    { name: 'NATS monitoring', url: 'http://localhost:8222/varz' },
     { name: 'Ollama API', url: 'http://localhost:11434/api/tags' },
   ];
 
@@ -222,6 +303,16 @@ export default async function globalSetup() {
       console.error(`  ✗ ${check.name}: ${err}`);
       throw new Error(`Infrastructure not ready: ${check.name} failed. Is the kind cluster running?`);
     }
+  }
+
+  // NATS client connectivity pre-flight — verifies the test can actually connect
+  try {
+    const nc = await connect({ servers: 'nats://localhost:4222' });
+    await nc.close();
+    console.log('  ✓ NATS client connection');
+  } catch (err) {
+    console.error(`  ✗ NATS client connection: ${err}`);
+    throw new Error('NATS client connection failed. Check NodePort mapping for NATS (4222).');
   }
 
   console.log('\n=== Infrastructure OK — running tests ===\n');
@@ -256,7 +347,7 @@ afterAll(async () => {
 describe('M1 Smoke Tests', () => {
   // ----- TEST 1: WebSocket Echo Round-Trip -----
   describe('WebSocket echo through NATS', () => {
-    test('sends a message and receives echo response', async () => {
+    test('sends a message and receives response', async () => {
       const client = new TestWsClient();
       await client.connect('acme');
 
@@ -264,7 +355,6 @@ describe('M1 Smoke Tests', () => {
       const response = await client.waitForMessage();
 
       expect(response.type).toBe('message');
-      expect(response.content).toContain('[echo]');
       expect(response.content).toContain('Hello from smoke test');
       expect(response.requestId).toMatch(/^req_/);
 
@@ -292,7 +382,7 @@ describe('M1 Smoke Tests', () => {
 
   // ----- TEST 2: Request Tracing -----
   describe('Request tracing', () => {
-    test('response contains timestamps array with gateway and echo-responder entries', async () => {
+    test('response contains timestamps array with multiple service hops', async () => {
       const client = new TestWsClient();
       await client.connect('acme');
 
@@ -302,21 +392,17 @@ describe('M1 Smoke Tests', () => {
       expect(response.timestamps).toBeDefined();
       expect(response.timestamps!.length).toBeGreaterThanOrEqual(2);
 
-      // Should have gateway entry
+      // Should have gateway entry (always present regardless of responder)
       const gatewayEntry = response.timestamps!.find(
         (t) => t.service === 'gateway' && t.event === 'received'
       );
       expect(gatewayEntry).toBeDefined();
 
-      // Should have echo-responder entries
-      const echoReceived = response.timestamps!.find(
-        (t) => t.service === 'echo-responder' && t.event === 'received'
+      // Should have at least one downstream service entry
+      const downstreamEntries = response.timestamps!.filter(
+        (t) => t.service !== 'gateway'
       );
-      const echoResponded = response.timestamps!.find(
-        (t) => t.service === 'echo-responder' && t.event === 'responded'
-      );
-      expect(echoReceived).toBeDefined();
-      expect(echoResponded).toBeDefined();
+      expect(downstreamEntries.length).toBeGreaterThanOrEqual(1);
 
       // Timestamps should be monotonically increasing
       for (let i = 1; i < response.timestamps!.length; i++) {
@@ -349,7 +435,7 @@ describe('M1 Smoke Tests', () => {
 
   // ----- TEST 3: Multi-Tenant Isolation -----
   describe('Tenant isolation', () => {
-    test('two tenants get independent echo responses', async () => {
+    test('two tenants get independent responses with no cross-talk', async () => {
       const acme = new TestWsClient();
       const globex = new TestWsClient();
 
@@ -369,20 +455,109 @@ describe('M1 Smoke Tests', () => {
       expect(acmeResp.content).not.toContain('globex');
       expect(globexResp.content).not.toContain('acme message');
 
+      // Verify no additional messages leak through (fan-out check)
+      await acme.expectNoMoreMessages(2000);
+      await globex.expectNoMoreMessages(2000);
+
       acme.close();
       globex.close();
     });
+  });
 
-    test('unknown tenant is rejected', async () => {
+  // ----- TEST 4: Session Isolation (same tenant, different sessions) -----
+  describe('Session isolation', () => {
+    test('two sessions for the same tenant receive only their own responses', async () => {
+      const session1 = new TestWsClient();
+      const session2 = new TestWsClient();
+
+      await session1.connect('acme');
+      await session2.connect('acme');
+
+      session1.send('session1 msg');
+      const resp1 = await session1.waitForMessage();
+      expect(resp1.content).toContain('session1 msg');
+
+      session2.send('session2 msg');
+      const resp2 = await session2.waitForMessage();
+      expect(resp2.content).toContain('session2 msg');
+
+      // Session 1 must NOT have received session 2's response (and vice versa)
+      await session1.expectNoMoreMessages(2000);
+      await session2.expectNoMoreMessages(2000);
+
+      session1.close();
+      session2.close();
+    });
+  });
+
+  // ----- TEST 5: WebSocket Close Codes -----
+  describe('WebSocket close codes', () => {
+    test('missing tenantId returns close code 4001', async () => {
+      const client = new TestWsClient();
+      await expect(client.connect('')).rejects.toThrow();
+      expect(client.closeEvent).toBeDefined();
+      expect(client.closeEvent!.code).toBe(4001);
+      client.close();
+    });
+
+    test('unknown tenant returns close code 4002', async () => {
       const client = new TestWsClient();
       await expect(client.connect('nonexistent')).rejects.toThrow();
+      expect(client.closeEvent).toBeDefined();
+      expect(client.closeEvent!.code).toBe(4002);
       client.close();
     });
   });
 
-  // ----- TEST 4: NATS Subject Hierarchy -----
+  // ----- TEST 6: WebSocket Upgrade Through Ingress -----
+  describe('WebSocket upgrade', () => {
+    test('connection receives HTTP 101 upgrade', async () => {
+      const client = new TestWsClient();
+      await client.connect('acme');
+
+      expect(client.upgradeResponse).toBeDefined();
+      expect(client.upgradeResponse!.statusCode).toBe(101);
+
+      client.close();
+    });
+  });
+
+  // ----- TEST 7: Error Frames -----
+  describe('Error frames', () => {
+    test('malformed message returns error frame', async () => {
+      const client = new TestWsClient();
+      await client.connect('acme');
+
+      // Send invalid JSON — Gateway should send an error frame back
+      client.sendRaw('this is not json');
+      const response = await client.waitForMessage();
+
+      expect(response.type).toBe('error');
+      expect(response.code).toBeDefined();
+
+      client.close();
+    });
+  });
+
+  // ----- TEST 8: Gateway Health Endpoint -----
+  describe('Gateway health', () => {
+    test('health endpoint reports dependency status', async () => {
+      const res = await fetch('http://localhost:8080/health');
+      expect(res.ok).toBe(true);
+
+      const body = await res.json() as any;
+      expect(body.status).toBe('ok');
+      expect(body.service).toBe('gateway');
+      expect(body.dependencies).toBeDefined();
+      expect(body.dependencies.nats).toBe(true);
+      expect(body.dependencies.mongodb).toBe(true);
+      expect(body.dependencies.redis).toBe(true);
+    });
+  });
+
+  // ----- TEST 9: NATS Subject Hierarchy -----
   describe('NATS subject hierarchy', () => {
-    test('messages are published to tenant-scoped subjects', async () => {
+    test('messages are published to tenant-scoped inbound subjects', async () => {
       // Subscribe to acme's inbound before sending a message
       const sub = nats.subscribe('voxline.acme.inbound');
       const msgPromise = (async () => {
@@ -400,12 +575,12 @@ describe('M1 Smoke Tests', () => {
       expect(natsMsg.tenantContext.tenantId).toBe('acme');
       expect(natsMsg.content).toBe('subject test');
 
-      await client.waitForMessage(); // consume echo
+      await client.waitForMessage(); // consume response
       client.close();
     });
   });
 
-  // ----- TEST 5: JetStream Stream Exists -----
+  // ----- TEST 10: JetStream Stream Exists -----
   describe('JetStream VOXLINE_EVENTS stream', () => {
     test('stream exists and accepts test publish', async () => {
       const jsm = await jetstreamManager(nats);
@@ -424,7 +599,7 @@ describe('M1 Smoke Tests', () => {
     });
   });
 
-  // ----- TEST 6: MongoDB Tenants Accessible -----
+  // ----- TEST 11: MongoDB Tenants Accessible -----
   describe('MongoDB tenant data', () => {
     test('all three seed tenants exist', async () => {
       const db = await getMongoDb();
@@ -463,7 +638,7 @@ describe('M1 Smoke Tests', () => {
     });
   });
 
-  // ----- TEST 7: Redis Accessible -----
+  // ----- TEST 12: Redis Accessible -----
   describe('Redis connectivity', () => {
     test('can set and get a key', async () => {
       const redis = getRedis();
@@ -474,7 +649,7 @@ describe('M1 Smoke Tests', () => {
     });
   });
 
-  // ----- TEST 8: Ollama Health -----
+  // ----- TEST 13: Ollama Health -----
   describe('Ollama accessibility', () => {
     test('Ollama API responds with model list', async () => {
       // Ollama is accessible via NodePort on localhost:11434
@@ -483,7 +658,7 @@ describe('M1 Smoke Tests', () => {
       );
       expect(res.ok).toBe(true);
 
-      const data = await res.json();
+      const data = await res.json() as any;
       const modelNames = data.models.map((m: any) => m.name);
 
       // Both models should be available
@@ -517,22 +692,35 @@ make test-m1
 ```
 === M1 Smoke Tests: Verifying Infrastructure ===
   ✓ Gateway health
+  ✓ NATS monitoring
+  ✓ Ollama API
+  ✓ NATS client connection
 
 === Infrastructure OK — running tests ===
 
  PASS  m1/smoke.test.ts
   M1 Smoke Tests
     WebSocket echo through NATS
-      ✓ sends a message and receives echo response
+      ✓ sends a message and receives response
       ✓ multiple messages get individual responses
     Request tracing
-      ✓ response contains timestamps array with gateway and echo-responder entries
+      ✓ response contains timestamps array with multiple service hops
       ✓ pipeline latency is under 500ms for echo
     Tenant isolation
-      ✓ two tenants get independent echo responses
-      ✓ unknown tenant is rejected
+      ✓ two tenants get independent responses with no cross-talk
+    Session isolation
+      ✓ two sessions for the same tenant receive only their own responses
+    WebSocket close codes
+      ✓ missing tenantId returns close code 4001
+      ✓ unknown tenant returns close code 4002
+    WebSocket upgrade
+      ✓ connection receives HTTP 101 upgrade
+    Error frames
+      ✓ malformed message returns error frame
+    Gateway health
+      ✓ health endpoint reports dependency status
     NATS subject hierarchy
-      ✓ messages are published to tenant-scoped subjects
+      ✓ messages are published to tenant-scoped inbound subjects
     JetStream VOXLINE_EVENTS stream
       ✓ stream exists and accepts test publish
     MongoDB tenant data
@@ -544,7 +732,7 @@ make test-m1
     Ollama accessibility
       ✓ Ollama API responds with model list
 
-Tests:       13 passed, 13 total
+Tests:       18 passed, 18 total
 ```
 
 ## Known Risks
@@ -552,6 +740,8 @@ Tests:       13 passed, 13 total
 | Risk | Mitigation |
 |---|---|
 | WebSocket test client timing | `waitForMessage` has a 10s default timeout. Echo responses should arrive in <100ms. If timeouts occur, check Gateway and echo-responder logs |
+| Connect grace period (500ms) slows tests | Required to catch server-initiated close codes (e.g., 4002 for unknown tenant). Without it, `open` fires before the server's async MongoDB lookup completes, and `connect()` resolves before the server closes the connection |
+| `expectNoMoreMessages` adds 2s to isolation tests | This is intentional — a fast-pass isolation test cannot prove the absence of fan-out. The 2s window catches delayed duplicates that would indicate a routing bug |
 | NATS subscription race condition | The NATS subject test subscribes before sending. If the subscribe is slow, the message may arrive before the subscription is active. The test handles this by starting the subscription first |
 | NodePort service not reachable from host | Verify kind extraPortMappings match NodePort values. Run `make cluster-status` and check all pods are Running |
 
@@ -562,7 +752,7 @@ Tests:       13 passed, 13 total
 
 ## M1 Completion
 
-When all 13 smoke tests pass, **M1 is complete**. The foundation is proven:
+When all 18 smoke tests pass, **M1 is complete**. The foundation is proven:
 - Kind cluster with all infrastructure running
 - NATS pub/sub with tenant-scoped subjects
 - JetStream stream for cold path

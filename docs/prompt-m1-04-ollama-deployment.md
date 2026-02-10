@@ -141,11 +141,12 @@ for i in $(seq 1 5); do
       "options": { "num_predict": 10, "presence_penalty": 1.5 }
     }' | python3 -c "
 import sys, json
+i = sys.argv[1]
 r = json.load(sys.stdin)
 dur_s = r.get('total_duration', 0) / 1e9
 tps = r.get('eval_count', 0) / (r.get('eval_duration', 1) / 1e9) if r.get('eval_duration') else 0
-print(f'  Run {$i}: {dur_s:.2f}s total, {tps:.1f} tok/s, response: {r.get(\"response\", \"\").strip()[:50]}')
-"
+print(f'  Run {i}: {dur_s:.2f}s total, {tps:.1f} tok/s, response: {r.get(\"response\", \"\").strip()[:50]}')
+" "$i"
 done
 
 echo ""
@@ -160,11 +161,12 @@ for i in $(seq 1 5); do
       "options": { "num_predict": 50, "presence_penalty": 1.5 }
     }' | python3 -c "
 import sys, json
+i = sys.argv[1]
 r = json.load(sys.stdin)
 dur_s = r.get('total_duration', 0) / 1e9
 tps = r.get('eval_count', 0) / (r.get('eval_duration', 1) / 1e9) if r.get('eval_duration') else 0
-print(f'  Run {$i}: {dur_s:.2f}s total, {tps:.1f} tok/s')
-"
+print(f'  Run {i}: {dur_s:.2f}s total, {tps:.1f} tok/s')
+" "$i"
 done
 
 echo ""

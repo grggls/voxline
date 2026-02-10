@@ -43,12 +43,15 @@ tsconfig.base.json             # Shared TypeScript config
   "workspaces": [
     "packages/*",
     "gateway",
+    "echo-responder",
     "intent-router",
-    "response-composer"
+    "response-composer",
+    "tests"
   ],
   "scripts": {
-    "build": "npm run build --workspaces",
+    "build": "npm run build --workspaces --if-present",
     "test": "npm run test --workspaces --if-present",
+    "test:m1": "npm test -w tests -- --testPathPattern=m1/",
     "lint": "eslint ."
   },
   "devDependencies": {
@@ -148,18 +151,24 @@ const HEADER_TENANT_ID = 'voxline-tenant-id';
 const HEADER_SESSION_ID = 'voxline-session-id';
 const HEADER_REQUEST_ID = 'voxline-request-id';
 const HEADER_TIMESTAMP = 'voxline-timestamp';
+const HEADER_REPLY_TO = 'voxline-reply-to';
 
 /**
  * Serialize TenantContext into a plain object suitable for NATS headers.
  * NATS headers are string key-value pairs.
+ * Optional replyTo sets the session-scoped outbound subject for downstream services.
  */
-export function injectTenantContext(ctx: TenantContext): Record<string, string> {
-  return {
+export function injectTenantContext(ctx: TenantContext, replyTo?: string): Record<string, string> {
+  const headers: Record<string, string> = {
     [HEADER_TENANT_ID]: ctx.tenantId,
     [HEADER_SESSION_ID]: ctx.sessionId,
     [HEADER_REQUEST_ID]: ctx.requestId,
     [HEADER_TIMESTAMP]: ctx.timestamp.toString(),
   };
+  if (replyTo) {
+    headers[HEADER_REPLY_TO] = replyTo;
+  }
+  return headers;
 }
 
 /**
@@ -180,6 +189,18 @@ export function extractTenantContext(headers: Record<string, string | string[] |
     requestId: get(HEADER_REQUEST_ID),
     timestamp: parseInt(get(HEADER_TIMESTAMP), 10),
   };
+}
+
+/**
+ * Extract the reply-to subject from NATS headers.
+ * Downstream services use this to know where to publish responses.
+ * Throws if the header is missing — every inbound message MUST have a reply-to.
+ */
+export function extractReplyTo(headers: Record<string, string | string[] | undefined>): string {
+  const val = headers[HEADER_REPLY_TO];
+  const str = Array.isArray(val) ? val[0] : val;
+  if (!str) throw new Error(`Missing ${HEADER_REPLY_TO} in NATS headers`);
+  return str;
 }
 ```
 
@@ -248,7 +269,7 @@ export * from './logger';
 
 ```typescript
 import { describe, test, expect } from '@jest/globals';
-import { TenantContext, injectTenantContext, extractTenantContext } from '../src';
+import { TenantContext, injectTenantContext, extractTenantContext, extractReplyTo } from '../src';
 
 describe('TenantContext NATS header round-trip', () => {
   test('tenant context survives injection and extraction', () => {
@@ -301,6 +322,25 @@ describe('TenantContext NATS header round-trip', () => {
     for (const key of Object.keys(headers)) {
       expect(key).toMatch(/^voxline-/);
     }
+  });
+
+  test('reply-to header round-trips through inject and extract', () => {
+    const ctx: TenantContext = {
+      tenantId: 'acme',
+      sessionId: 'sess_1',
+      requestId: 'req_abc123',
+      timestamp: 1707500000000,
+    };
+
+    const headers = injectTenantContext(ctx, 'voxline.acme.sess_1.outbound');
+    expect(headers['voxline-reply-to']).toBe('voxline.acme.sess_1.outbound');
+
+    const replyTo = extractReplyTo(headers);
+    expect(replyTo).toBe('voxline.acme.sess_1.outbound');
+  });
+
+  test('extractReplyTo throws on missing reply-to header', () => {
+    expect(() => extractReplyTo({})).toThrow('Missing voxline-reply-to');
   });
 });
 ```
@@ -387,13 +427,23 @@ module.exports = {
 3. **Unit tests pass:**
    ```bash
    npm test -w packages/shared
-   # All 5 tests should pass
+   # All 7 tests should pass (5 original + 2 reply-to tests)
    ```
 
 4. **Verify workspace linking:**
    ```bash
    # From any workspace, @voxline/shared should resolve
    node -e "console.log(require.resolve('@voxline/shared'))"
+   ```
+
+5. **Verify NATS v3 imports resolve correctly:**
+   ```bash
+   # The NATS v3 client is split across multiple packages:
+   #   @nats-io/transport-node — connect(), NatsConnection
+   #   @nats-io/nats-core — headers(), MsgHdrs (re-exported by transport-node but import directly for clarity)
+   #   @nats-io/jetstream — jetstream(), jetstreamManager()
+   # Verify the import that services will use:
+   node -e "const { connect } = require('@nats-io/transport-node'); console.log('transport-node OK')"
    ```
 
 ## Dependencies

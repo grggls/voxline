@@ -21,10 +21,13 @@ React UI ←→ [WebSocket] ←→ Gateway ←→ [NATS] ←→ downstream servi
 The Gateway:
 - Accepts WebSocket connections with a `tenantId` parameter
 - Loads tenant config from MongoDB on connection
-- Generates `requestId` for every message (request tracing)
+- Generates `sessionId` per connection, `requestId` per message (request tracing)
 - Publishes user messages to `voxline.{tenantId}.inbound` via Core NATS
-- Subscribes to `voxline.{tenantId}.outbound` for responses
-- Forwards responses back to the WebSocket client
+- Includes `voxline-reply-to` header with session-scoped outbound subject
+- Subscribes to `voxline.{tenantId}.{sessionId}.outbound` for responses (session-scoped — no fan-out)
+- Forwards responses and error frames back to the WebSocket client
+- Reports deep health status (NATS, MongoDB, Redis) via event-driven state tracking
+- Shuts down gracefully on SIGTERM (stop accepting → close WebSockets → drain NATS → close deps)
 - Initializes connection pools at startup (not per-request)
 
 ## What to Build
@@ -76,23 +79,73 @@ import { createLogger } from '@voxline/shared';
 const logger = createLogger('gateway');
 
 let natsConn: NatsConnection;
+let mongoClient: MongoClient;
 let mongoDB: Db;
 let redisClient: Redis;
+
+// --- Health state: updated via event listeners, never queried on probe path ---
+const health = { nats: true, mongodb: true, redis: true };
 
 export async function initConnections(): Promise<void> {
   // NATS — persistent connection with auto-reconnect
   natsConn = await natsConnect({ servers: config.nats.url });
   logger.info('nats.connected');
 
+  // Track NATS connection health via status events
+  (async () => {
+    for await (const s of natsConn.status()) {
+      if (s.type === 'disconnect' || s.type === 'error') {
+        health.nats = false;
+        logger.warn('nats.unhealthy', undefined, { event: s.type });
+      } else if (s.type === 'reconnect') {
+        health.nats = true;
+        logger.info('nats.reconnected');
+      }
+    }
+  })();
+
   // MongoDB — connection pool managed by driver
-  const mongoClient = new MongoClient(config.mongodb.url);
+  mongoClient = new MongoClient(config.mongodb.url);
   await mongoClient.connect();
   mongoDB = mongoClient.db();
   logger.info('mongodb.connected');
 
+  // Track MongoDB health via topology events
+  mongoClient.on('serverHeartbeatFailed', () => {
+    health.mongodb = false;
+    logger.warn('mongodb.unhealthy');
+  });
+  mongoClient.on('serverHeartbeatSucceeded', () => {
+    if (!health.mongodb) {
+      health.mongodb = true;
+      logger.info('mongodb.reconnected');
+    }
+  });
+
   // Redis — persistent connection
   redisClient = new Redis(config.redis.url);
   logger.info('redis.connected');
+
+  redisClient.on('error', () => { health.redis = false; });
+  redisClient.on('ready', () => { health.redis = true; });
+}
+
+/**
+ * Returns current health state. No I/O — reads event-driven booleans only.
+ * Used by /health endpoint and readiness probe.
+ */
+export function getHealth(): { nats: boolean; mongodb: boolean; redis: boolean } {
+  return { ...health };
+}
+
+/**
+ * Graceful shutdown: close all connections in reverse order.
+ * Called by SIGTERM handler in index.ts.
+ */
+export async function closeConnections(): Promise<void> {
+  await redisClient?.quit();
+  await mongoClient?.close();
+  await natsConn?.drain();
 }
 
 export function getNats(): NatsConnection { return natsConn; }
@@ -129,7 +182,7 @@ import { URL } from 'url';
 import { TenantContext, VoxlineMessage, TenantConfig, createLogger, injectTenantContext } from '@voxline/shared';
 import { getNats, getMongoDB } from './connections';
 import { generateRequestId } from './request-tracing';
-import { headers as natsHeaders } from '@nats-io/transport-node';
+import { headers as natsHeaders } from '@nats-io/nats-core';
 
 const logger = createLogger('gateway');
 
@@ -158,21 +211,26 @@ export function setupWebSocket(wss: WebSocketServer): void {
 
     logger.info('ws.connected', { tenantId, sessionId } as Partial<TenantContext>, { tenant: tenantConfig.name });
 
-    // Subscribe to outbound NATS subject for this tenant
+    // Session-scoped outbound subject — only this WebSocket connection receives responses
     const nats = getNats();
-    const outboundSubject = `voxline.${tenantId}.outbound`;
-    const sub = nats.subscribe(outboundSubject);
+    const replyTo = `voxline.${tenantId}.${sessionId}.outbound`;
+    const sub = nats.subscribe(replyTo);
 
     // Forward NATS outbound messages to WebSocket
     (async () => {
       for await (const msg of sub) {
         try {
           const payload = JSON.parse(msg.string()) as VoxlineMessage;
+          // Forward message or error frames to the WebSocket client
           ws.send(JSON.stringify({
-            type: 'message',
+            type: payload.metadata?.error ? 'error' : 'message',
             content: payload.content,
             requestId: payload.tenantContext.requestId,
             timestamps: payload.timestamps,
+            ...(payload.metadata?.error ? {
+              code: payload.metadata.code,
+              message: payload.metadata.message,
+            } : {}),
           }));
         } catch (err) {
           logger.error('ws.forward.error', err);
@@ -199,9 +257,9 @@ export function setupWebSocket(wss: WebSocketServer): void {
           timestamps: [{ service: 'gateway', event: 'received', ts: Date.now() }],
         };
 
-        // Publish to NATS inbound subject with tenant context in headers
+        // Publish to NATS inbound subject with tenant context + reply-to in headers
         const h = natsHeaders();
-        const headerMap = injectTenantContext(ctx);
+        const headerMap = injectTenantContext(ctx, replyTo);
         for (const [key, val] of Object.entries(headerMap)) {
           h.set(key, val);
         }
@@ -215,6 +273,12 @@ export function setupWebSocket(wss: WebSocketServer): void {
         logger.info('nats.published', ctx, { subject: `voxline.${tenantId}.inbound` });
       } catch (err) {
         logger.error('ws.message.error', err);
+        // Send error frame to the client for malformed messages
+        ws.send(JSON.stringify({
+          type: 'error',
+          code: 'INTERNAL_ERROR',
+          message: 'Failed to process message',
+        }));
       }
     });
 
@@ -234,7 +298,7 @@ import express from 'express';
 import { createServer } from 'http';
 import { WebSocketServer } from 'ws';
 import { config } from './config';
-import { initConnections } from './connections';
+import { initConnections, getHealth, closeConnections } from './connections';
 import { setupWebSocket } from './websocket';
 import { createLogger } from '@voxline/shared';
 
@@ -247,9 +311,16 @@ async function main() {
   const app = express();
   app.use(express.json());
 
-  // Health check endpoint
+  // Deep health check — returns 200 when all deps are healthy, 503 when degraded.
+  // No I/O on the probe path — reads event-driven booleans from connections.ts.
   app.get('/health', (_req, res) => {
-    res.json({ status: 'ok', service: 'gateway' });
+    const deps = getHealth();
+    const allHealthy = deps.nats && deps.mongodb && deps.redis;
+    res.status(allHealthy ? 200 : 503).json({
+      status: allHealthy ? 'ok' : 'degraded',
+      service: 'gateway',
+      dependencies: deps,
+    });
   });
 
   const server = createServer(app);
@@ -261,6 +332,28 @@ async function main() {
   server.listen(config.port, () => {
     logger.info('server.started', undefined, { port: config.port });
   });
+
+  // --- Graceful shutdown ---
+  const shutdown = async (signal: string) => {
+    logger.info('shutdown.start', undefined, { signal });
+
+    // 1. Stop accepting new connections
+    server.close();
+
+    // 2. Close all WebSocket connections
+    for (const client of wss.clients) {
+      client.close(1001, 'Server shutting down');
+    }
+
+    // 3. Close infrastructure connections (drain NATS, close Mongo, quit Redis)
+    await closeConnections();
+
+    logger.info('shutdown.complete');
+    process.exit(0);
+  };
+
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+  process.on('SIGINT', () => shutdown('SIGINT'));
 }
 
 main().catch((err) => {
@@ -284,6 +377,7 @@ main().catch((err) => {
     "express": "^5.2",
     "ws": "^8.16",
     "@nats-io/transport-node": "^3.3",
+    "@nats-io/nats-core": "^3.3",
     "mongodb": "^7.1",
     "ioredis": "^5.3",
     "@voxline/shared": "*"
@@ -370,6 +464,24 @@ spec:
               value: "mongodb://mongodb.voxline.svc.cluster.local:27017/voxline"
             - name: REDIS_URL
               value: "redis://redis-master.voxline.svc.cluster.local:6379"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 3000
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 3000
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            failureThreshold: 3
+          lifecycle:
+            preStop:
+              exec:
+                command: ["sh", "-c", "sleep 5"]   # Allow in-flight requests to drain
           resources:
             requests:
               cpu: 100m

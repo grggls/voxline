@@ -16,9 +16,11 @@ UI → WebSocket → Gateway → NATS (inbound) → Echo Responder → NATS (out
 
 The echo responder:
 - Subscribes to `voxline.*.inbound` (wildcard — all tenants)
-- Extracts `TenantContext` from NATS headers
+- Extracts `TenantContext` and `voxline-reply-to` header from NATS headers
 - Appends its own timestamp to the `timestamps` array (request tracing)
-- Publishes an echo response to `voxline.{tenantId}.outbound`
+- Publishes an echo response to the session-scoped subject from `voxline-reply-to` (not a constructed subject)
+- Exposes a health HTTP server on port 3001 (for k8s readiness/liveness probes)
+- Shuts down gracefully on SIGTERM (unsubscribe, drain NATS)
 - Logs structured JSON at each step
 
 ## What to Build
@@ -50,8 +52,10 @@ export const config = {
 ### 3. `echo-responder/src/index.ts`
 
 ```typescript
-import { connect, headers as natsHeaders } from '@nats-io/transport-node';
-import { VoxlineMessage, extractTenantContext, injectTenantContext, createLogger } from '@voxline/shared';
+import { connect } from '@nats-io/transport-node';
+import { headers as natsHeaders } from '@nats-io/nats-core';
+import { createServer } from 'http';
+import { VoxlineMessage, extractTenantContext, extractReplyTo, injectTenantContext, createLogger } from '@voxline/shared';
 import { config } from './config';
 
 const logger = createLogger('echo-responder');
@@ -64,9 +68,30 @@ async function main() {
   const sub = nc.subscribe('voxline.*.inbound');
   logger.info('subscribed', undefined, { subject: 'voxline.*.inbound' });
 
+  // --- Minimal health HTTP server (for readiness/liveness probes) ---
+  const healthServer = createServer((_req, res) => {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ status: 'ok', service: 'echo-responder' }));
+  });
+  healthServer.listen(3001, () => {
+    logger.info('health.listening', undefined, { port: 3001 });
+  });
+
+  // --- Graceful shutdown ---
+  const shutdown = async (signal: string) => {
+    logger.info('shutdown.start', undefined, { signal });
+    sub.unsubscribe();
+    await nc.drain();
+    healthServer.close();
+    logger.info('shutdown.complete');
+    process.exit(0);
+  };
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+  process.on('SIGINT', () => shutdown('SIGINT'));
+
   for await (const msg of sub) {
     try {
-      // Extract tenant context from headers
+      // Extract tenant context and reply-to subject from headers
       const headerMap: Record<string, string> = {};
       if (msg.headers) {
         for (const [key, values] of msg.headers) {
@@ -74,6 +99,7 @@ async function main() {
         }
       }
       const ctx = extractTenantContext(headerMap);
+      const replyTo = extractReplyTo(headerMap);
 
       // Parse the message payload
       const payload = JSON.parse(msg.string()) as VoxlineMessage;
@@ -97,17 +123,16 @@ async function main() {
         ],
       };
 
-      // Publish to outbound subject for this tenant
-      const outboundSubject = `voxline.${ctx.tenantId}.outbound`;
+      // Publish to the session-scoped outbound subject from the reply-to header
       const h = natsHeaders();
       const ctxHeaders = injectTenantContext(ctx);
       for (const [key, val] of Object.entries(ctxHeaders)) {
         h.set(key, val);
       }
 
-      nc.publish(outboundSubject, JSON.stringify(response), { headers: h });
+      nc.publish(replyTo, JSON.stringify(response), { headers: h });
 
-      logger.info('published', ctx, { subject: outboundSubject });
+      logger.info('published', ctx, { subject: replyTo });
     } catch (err) {
       logger.error('message.error', err);
     }
@@ -133,6 +158,7 @@ main().catch((err) => {
   },
   "dependencies": {
     "@nats-io/transport-node": "^3.3",
+    "@nats-io/nats-core": "^3.3",
     "@voxline/shared": "*"
   },
   "devDependencies": {
@@ -203,9 +229,23 @@ spec:
         - name: echo-responder
           image: voxline/echo-responder:latest
           imagePullPolicy: Never
+          ports:
+            - containerPort: 3001
           env:
             - name: NATS_URL
               value: "nats://nats.voxline.svc.cluster.local:4222"
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 3001
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 3001
+            initialDelaySeconds: 5
+            periodSeconds: 10
           resources:
             requests:
               cpu: 50m
