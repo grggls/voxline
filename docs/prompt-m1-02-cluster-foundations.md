@@ -498,11 +498,16 @@ infra/
 
 8. **OTel Collector accepts OTLP (smoke test):**
    ```bash
-   kubectl exec -n monitoring deploy/otel-collector-opentelemetry-collector -- \
-     wget -q -O- --post-data='{"resourceSpans":[]}' \
-     --header='Content-Type: application/json' \
+   # The contrib image has no wget/curl, so port-forward from host
+   kubectl port-forward -n monitoring deploy/otel-collector-opentelemetry-collector 4318:4318 &
+   PF_PID=$!
+   sleep 2
+   curl -s -o /dev/null -w "%{http_code}" -X POST \
+     -H 'Content-Type: application/json' \
+     -d '{"resourceSpans":[]}' \
      http://localhost:4318/v1/traces
-   # Should return 200 (empty but accepted)
+   # Should return 200
+   kill $PF_PID 2>/dev/null
    ```
 
 9. **StorageClass works (PVC provisions):**

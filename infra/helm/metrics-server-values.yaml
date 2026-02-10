@@ -1,0 +1,11 @@
+# kubernetes-sigs/metrics-server chart
+# Required for `kubectl top` and HPA in kind clusters
+args:
+  - --kubelet-insecure-tls      # Required for kind — kubelet uses self-signed certs
+resources:
+  requests:
+    cpu: 50m
+    memory: 50Mi
+  limits:
+    cpu: 100m
+    memory: 100Mi

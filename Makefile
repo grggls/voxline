@@ -1,6 +1,7 @@
 CLUSTER_NAME := voxline
 
-.PHONY: cluster-up cluster-down cluster-stop cluster-start cluster-status
+.PHONY: cluster-up cluster-down cluster-stop cluster-start cluster-status \
+       foundations-up foundations-down foundations-status
 
 cluster-up:
 	@bash infra/kind/create-cluster.sh
@@ -33,3 +34,26 @@ cluster-status:
 	@echo ""
 	@echo "=== Resource Usage ==="
 	@kubectl top nodes 2>/dev/null || echo "(metrics-server not yet installed — run 'make foundations-up')"
+
+# === Foundations (Observability, Metrics, Storage) ===
+
+foundations-up:
+	@bash infra/helm/deploy-foundations.sh
+
+foundations-down:
+	helm uninstall otel-collector -n monitoring || true
+	helm uninstall kube-prometheus-stack -n monitoring || true
+	helm uninstall metrics-server -n kube-system || true
+
+foundations-status:
+	@echo "=== Foundations Status ==="
+	@echo ""
+	@echo "--- metrics-server ---"
+	@kubectl top nodes 2>/dev/null || echo "  Not ready"
+	@echo ""
+	@echo "--- Monitoring Pods ---"
+	@kubectl get pods -n monitoring
+	@echo ""
+	@echo "--- Grafana ---"
+	@echo "  URL: http://localhost:30000"
+	@echo "  Credentials: admin / voxline"

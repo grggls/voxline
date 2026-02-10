@@ -1,0 +1,84 @@
+# prometheus-community/kube-prometheus-stack chart
+
+# --- Prometheus ---
+prometheus:
+  service:
+    type: NodePort
+    nodePort: 30090                   # Accessible at http://localhost:9090
+  prometheusSpec:
+    resources:
+      requests:
+        cpu: 200m
+        memory: 256Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
+    retention: 24h                    # Keep 24h of metrics — sufficient for local dev
+    storageSpec:
+      volumeClaimTemplate:
+        spec:
+          accessModes: ["ReadWriteOnce"]
+          resources:
+            requests:
+              storage: 2Gi
+    # Scrape all ServiceMonitors in all namespaces
+    serviceMonitorSelectorNilUsesHelmValues: false
+    podMonitorSelectorNilUsesHelmValues: false
+
+# --- Grafana ---
+grafana:
+  adminUser: admin
+  adminPassword: voxline            # Local dev only — not a secret
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 200m
+      memory: 256Mi
+  service:
+    type: NodePort
+    nodePort: 30000                  # Accessible at http://localhost:30000
+  # Pre-provision Voxline dashboard
+  dashboardProviders:
+    dashboardproviders.yaml:
+      apiVersion: 1
+      providers:
+        - name: voxline
+          orgId: 1
+          folder: Voxline
+          type: file
+          disableDeletion: false
+          editable: true
+          options:
+            path: /var/lib/grafana/dashboards/voxline
+  dashboardsConfigMaps:
+    voxline: grafana-voxline-dashboard
+  sidecar:
+    dashboards:
+      enabled: true
+      searchNamespace: ALL
+
+# --- node-exporter ---
+nodeExporter:
+  resources:
+    requests:
+      cpu: 50m
+      memory: 32Mi
+    limits:
+      cpu: 100m
+      memory: 64Mi
+
+# --- kube-state-metrics ---
+kube-state-metrics:
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 100m
+      memory: 128Mi
+
+# --- Alertmanager (disabled — not needed for learning project) ---
+alertmanager:
+  enabled: false
