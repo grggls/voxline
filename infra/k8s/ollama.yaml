@@ -1,0 +1,68 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ollama
+  namespace: voxline
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ollama
+  template:
+    metadata:
+      labels:
+        app: ollama
+    spec:
+      containers:
+        - name: ollama
+          image: ollama/ollama:latest
+          ports:
+            - containerPort: 11434
+          env:
+            - name: OLLAMA_KEEP_ALIVE
+              value: "-1"           # Never evict model from memory
+            - name: OLLAMA_NUM_PARALLEL
+              value: "2"            # Handle concurrent requests to qwen3:0.6b
+            - name: OLLAMA_HOST
+              value: "0.0.0.0"
+            - name: OLLAMA_CONTEXT_LENGTH
+              value: "2048"         # Halved from 4096 default — sufficient for chat + classification
+          resources:
+            requests:
+              cpu: 1000m
+              memory: 1Gi
+            limits:
+              cpu: 2000m
+              memory: 2Gi           # Qwen3 0.6B (~500 Mi) + KV cache + inference headroom
+          volumeMounts:
+            - name: ollama-data
+              mountPath: /root/.ollama
+      volumes:
+        - name: ollama-data
+          persistentVolumeClaim:
+            claimName: ollama-data
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ollama-data
+  namespace: voxline
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 3Gi              # Oversized for single 0.6B model (~522 MB) but PVC can't shrink in-place
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ollama
+  namespace: voxline
+spec:
+  selector:
+    app: ollama
+  ports:
+    - port: 11434
+      targetPort: 11434
+      nodePort: 30434              # Accessible at http://localhost:11434
+  type: NodePort

@@ -39,7 +39,7 @@ Qwen3 models offer a generation-over-generation improvement that directly benefi
 
 **Density gains:** Qwen3 dense base models match Qwen2.5 models at roughly 2x the parameter count. Qwen3-1.7B performs comparably to Qwen2.5-3B. Qwen3-4B rivals Qwen2.5-72B-Instruct on reasoning benchmarks. This means better chat quality at the same resource cost.
 
-**Thinking / non-thinking modes:** Qwen3 supports `/think` and `/no_think` mode switching within a single model. For intent classification, `/no_think` gives fast, direct responses. For complex conversation turns, `/think` allows step-by-step reasoning when needed. This is a free capability upgrade — same model, two behaviors controlled by prompt.
+**Thinking / non-thinking modes:** Qwen3 supports thinking and non-thinking modes within a single model. For intent classification, non-thinking mode (`"think": false` in the Ollama API) gives fast, direct responses. For complex conversation turns, thinking mode allows step-by-step reasoning when needed. This is a free capability upgrade — same model, two behaviors. **Important:** The `/no_think` prompt prefix does not work with Ollama >= 0.15 — use the `"think": false` API parameter instead.
 
 **Better training foundation:** Qwen3 was trained on ~36 trillion tokens (vs. 18T for Qwen2.5), with knowledge distillation from Qwen3-235B. The small models retain more capability from the larger models.
 
@@ -51,17 +51,26 @@ Qwen3 models offer a generation-over-generation improvement that directly benefi
 
 | Model | Params | RAM (quantized) | Quality | CPU tok/s (est.) | Role in Voxline |
 |---|---|---|---|---|---|
-| **Qwen3 0.6B** | 0.6B | ~300 Mi | Good for classification; reasoning improved over Qwen2.5 0.5B | 30-60 | **Intent classification** |
-| **Qwen3 1.7B** | 1.7B | ~850 Mi | Matches Qwen2.5-3B quality; strong instruction following | 25-45 | **Default chat model** |
+| **Qwen3 0.6B** | 0.6B | ~300 Mi | Good for classification; reasoning improved over Qwen2.5 0.5B | 30-60 | **Classification + chat (active)** |
+| **Qwen3 1.7B** | 1.7B | ~850 Mi | Matches Qwen2.5-3B quality; strong instruction following | 25-45 | Unusable in Docker Desktop (see below) |
 | **Qwen3 4B** | 4B | ~2.5 Gi | Rivals Qwen2.5-72B on reasoning; excellent for its size | 15-25 | Upgrade if 32+ GB machine |
 | Gemma 3 1B | 1B | ~500 Mi | Fast, good for 1B class | 35-60 | Alternative (fastest) |
 | TinyLlama 1.1B | 1.1B | ~550 Mi | Mature ecosystem, proven | 20-40 | Alternative (most proven) |
 
-**Default config:** Qwen3 0.6B for intent classification + Qwen3 1.7B for chat. Total LLM RAM ~1.0-1.5 Gi.
+**Active config (post-benchmark):** Qwen3 0.6B for both intent classification and chat. Single model, ~500 Mi LLM RAM.
 
 **Important:** Qwen3 quantized models may exhibit repetition. Set `presence_penalty: 1.5` in Ollama requests for quantized models to suppress this. Adjustable between 0-2 — higher values may occasionally cause language mixing.
 
-**Benchmark before committing:** Spend 1 hour in M1 measuring actual tok/s for both models on your specific CPU. The estimates above are generic. If your machine does significantly less (e.g., 15 tok/s for 1.7B), the entire latency budget needs revision and you may need to drop to Qwen3 0.6B for both roles or switch to a different model family. This is a gated decision point, not an assumption.
+### Benchmark Gate Result (M1-04)
+
+The tok/s estimates above are for **native** CPU inference (Apple Silicon with Metal). Running Ollama **inside Docker Desktop** on macOS ARM eliminates Metal acceleration — the Docker VM uses software-only CPU inference, which is orders of magnitude slower for larger models.
+
+| Model | Native (est.) | Docker Desktop (measured) | Threshold | Verdict |
+|---|---|---|---|---|
+| Qwen3 0.6B | 30-60 tok/s | 28-54 tok/s (warm) | >= 25 | **PASS** |
+| Qwen3 1.7B | 25-45 tok/s | 0.5-0.9 tok/s | >= 20 | **FAIL** |
+
+**Decision:** Use Qwen3 0.6B for both roles. The 1.7B model can be reintroduced if Docker Desktop memory is increased to >= 16 GB or if Ollama runs natively outside the cluster. The provider interface and tenant config support per-model selection, so upgrading is a config change. See [prompt-m1-04](docs/prompt-m1-04-ollama-deployment.md) for the full memory tuning journey.
 
 ## NATS-First Event Strategy
 
@@ -110,9 +119,9 @@ This saves ~1.5 Gi RAM and significant configuration time in early milestones, l
 
 ### 3. LLM Service (`llm-service/` — Python, FastAPI)
 - Calls Ollama running locally in the cluster (OpenAI-compatible `/v1/chat/completions` endpoint)
-- **Two-model strategy:**
-  - **Intent classification:** Qwen3 0.6B (Q4_K_M) — ~300MB, 30-60 tok/s. Fast enough to classify intent without noticeable latency. The Intent Router calls this via the LLM Service for classification, keeping the Intent Router itself as a pure routing service.
-  - **Conversation response:** Qwen3 1.7B (Q4_K_M) — ~850MB, 25-45 tok/s. Matches Qwen2.5-3B quality with thinking/non-thinking modes.
+- **Single-model strategy (post-benchmark gate):**
+  - **Both roles:** Qwen3 0.6B (Q4_K_M) — ~500MB, 28-54 tok/s warm in Docker Desktop. Handles both intent classification (`think:false` mode) and conversation response. The Intent Router calls this via the LLM Service for classification, keeping the Intent Router itself as a pure routing service. **All Ollama API calls must include `"think": false`** — the `/no_think` prompt prefix does not work with Ollama >= 0.15.
+  - **Upgrade path:** Tenant config supports per-model selection (`classifyModel`, `chatModel`). Switching to 1.7B or 4B is a config change if running Ollama natively or with more Docker memory.
 - Prompt construction with conversation context from MongoDB
 - Streaming response back via NATS (token-by-token from Ollama's streaming API)
 - Response caching in Redis (identical prompts within TTL)
@@ -173,7 +182,7 @@ Running the full stack in `kind` on a laptop. All numbers are for CPU-only infer
 
 | Component | CPU Request | CPU Limit | RAM Request | RAM Limit | Notes |
 |---|---|---|---|---|---|
-| **Ollama (2 models)** | 1000m | 2000m | 1.0 Gi | 1.5 Gi | Qwen3 0.6B + 1.7B loaded. `KEEP_ALIVE=-1` to prevent eviction |
+| **Ollama (1 model)** | 1000m | 2000m | 1.0 Gi | 2.0 Gi | Qwen3 0.6B loaded. `KEEP_ALIVE=-1`, `CONTEXT_LENGTH=2048` |
 | **MongoDB** | 250m | 500m | 256 Mi | 512 Mi | Single replica, WiredTiger cache capped at 256MB |
 | **NATS** | 100m | 250m | 64 Mi | 128 Mi | Core NATS + JetStream. Handles hot path and cold path in M1-M2 |
 | **Redis** | 100m | 250m | 64 Mi | 128 Mi | In-memory, small dataset |
@@ -189,9 +198,9 @@ Running the full stack in `kind` on a laptop. All numbers are for CPU-only infer
 | | CPU Request | CPU Limit | RAM Request | RAM Limit |
 |---|---|---|---|---|
 | **Observability** (Prometheus, Grafana, metrics-server, OTel, exporters) | 0.55 cores | 1.2 cores | 0.6 Gi | 1.2 Gi |
-| **Infrastructure** (Ollama, Mongo, NATS, Redis) | 1.45 cores | 3.0 cores | 1.4 Gi | 2.3 Gi |
+| **Infrastructure** (Ollama, Mongo, NATS, Redis) | 1.45 cores | 3.0 cores | 1.4 Gi | 2.8 Gi |
 | **Application services** (6 services) | 0.55 cores | 1.35 cores | 0.7 Gi | 1.4 Gi |
-| **Total** | **2.55 cores** | **5.55 cores** | **2.7 Gi** | **4.9 Gi** |
+| **Total** | **2.55 cores** | **5.55 cores** | **2.7 Gi** | **5.4 Gi** |
 
 ### Totals (M3+, with Kafka)
 
@@ -212,9 +221,9 @@ Add ~1-2 Gi for `kind` + Docker overhead.
 
 ### Latency Reality Check
 
-With Qwen3 1.7B on CPU: expect 25-45 tok/s, so a 50-100 token response completes in ~1-3 seconds. Streaming token-by-token through NATS → WebSocket means the user sees the first token in ~100-300ms. The <500ms target is **time-to-first-token** — the metric production voice AI systems actually optimize for.
+With Qwen3 0.6B on CPU inside Docker Desktop: measured 28-54 tok/s when warm, so a 50-100 token response completes in ~1-3 seconds. Streaming token-by-token through NATS → WebSocket means the user sees the first token in ~100-300ms. The <500ms target is **time-to-first-token** — the metric production voice AI systems actually optimize for. Note: tok/s varies significantly under Docker Desktop CPU contention — the range reflects real-world variance, not just warm vs. cold.
 
-Intent classification with Qwen3 0.6B in `/no_think` mode: 30-60 tok/s for a ~10 token classification response = sub-500ms total. Effectively invisible in the pipeline.
+Intent classification with Qwen3 0.6B in `think:false` mode: 28-54 tok/s for a ~10 token classification response = sub-500ms total. Effectively invisible in the pipeline.
 
 ### Going Even Lighter
 
@@ -222,9 +231,9 @@ If resources are truly constrained, the absolute minimum viable setup:
 
 | Setup | LLM RAM | Total Stack RAM | Trade-off |
 |---|---|---|---|
-| **Default** (Qwen3 0.6B + 1.7B, Ollama) | ~1.1 Gi | ~2.1 Gi request | Good balance |
-| **Light** (TinyLlama 1.1B only, Ollama) | ~600 Mi | ~1.6 Gi request | Single model, skip separate classifier |
-| **Minimal** (Qwen3 0.6B only, Ollama) | ~300 Mi | ~1.3 Gi request | Basic chat quality, lightest possible |
+| **Current** (Qwen3 0.6B only, Ollama) | ~500 Mi | ~1.5 Gi request | Active config — single model, both roles |
+| **Upgrade** (Qwen3 0.6B + 1.7B, Ollama) | ~1.9 Gi | ~2.9 Gi request | Requires native Ollama or >= 16 GB Docker memory |
+| **Alternative** (TinyLlama 1.1B only, Ollama) | ~600 Mi | ~1.6 Gi request | Single model, skip separate classifier |
 
 ## Multi-Tenancy (Logical Isolation)
 
@@ -300,7 +309,7 @@ Stored in MongoDB `tenants` collection:
   name: "Acme Corp",
   config: {
     rateLimit: { maxPerMinute: 60 },
-    llm: { chatModel: "qwen3:1.7b", classifyModel: "qwen3:0.6b", provider: "ollama", systemPrompt: "You are Acme's support agent..." },
+    llm: { chatModel: "qwen3:0.6b", classifyModel: "qwen3:0.6b", provider: "ollama", systemPrompt: "You are Acme's support agent..." },
     features: { streamingEnabled: true }
   }
 }
@@ -535,13 +544,13 @@ JSON serialization adds ~0.5-1ms per message on Node.js for a typical payload. M
 | UI → Gateway (WebSocket) | <1ms | Persistent connection, localhost |
 | Gateway: Redis pipeline (rate limit + cache) | ~1ms | Single pipelined call |
 | Gateway → NATS → Intent Router | <1ms | Core NATS, sub-millisecond |
-| Intent classification (Qwen3 0.6B, `/no_think`) | ~100-200ms | 10-token classification, 30-60 tok/s |
+| Intent classification (Qwen3 0.6B, `think:false`) | ~100-200ms | 10-token classification, 28-54 tok/s warm (measured) |
 | Intent Router → NATS → LLM Service | <1ms | Core NATS |
 | LLM Service: load context (pre-fetched or MongoDB) | 0-5ms | 0ms if pre-fetched in NATS header, ~5ms if querying MongoDB |
-| Ollama TTFT (Qwen3 1.7B, warm, pruned context) | ~100-300ms | Dominant cost. KV cache reuse helps on warm prompts |
+| Ollama TTFT (Qwen3 0.6B, warm, pruned context) | ~50-150ms | Faster than 1.7B estimate due to smaller model. KV cache reuse helps on warm prompts |
 | LLM Service → NATS → Response Composer → NATS → Gateway → UI | <3ms | 3 NATS hops + streaming pass-through |
-| **Total TTFT** | **~200-500ms** | **Within budget** |
-| Full response streaming | 1-3s | 50-100 tokens at 25-45 tok/s, streamed token-by-token |
+| **Total TTFT** | **~150-400ms** | **Within budget** |
+| Full response streaming | 1-3s | 50-100 tokens at 28-54 tok/s warm, streamed token-by-token |
 
 ### What This Teaches
 
@@ -810,9 +819,9 @@ This gives concrete evidence for "LangGraph improved classification accuracy fro
 
 ### M1: Foundations + Tenant Model (2-3 days)
 - `kind` cluster running with NATS (Core + JetStream), MongoDB, Redis, **Ollama** via Helm charts
-- **Ollama benchmark gate:** Pull Qwen3 0.6B and Qwen3 1.7B into Ollama, measure actual tok/s on your CPU, verify inference works via `curl`. If numbers don't meet latency budget, adjust model selection before proceeding
-- Ollama configured with `KEEP_ALIVE=-1` and `NUM_PARALLEL=2` — models stay warm from day 1
-- Set `presence_penalty: 1.5` in Ollama request defaults for Qwen3 quantized models
+- **Ollama benchmark gate:** Pull Qwen3 0.6B into Ollama, measure actual tok/s and TTFT, verify inference works via HostPort. Benchmark gate triggered — 1.7B unusable in Docker Desktop (0.5-0.9 tok/s), 0.6B passes all thresholds (28-54 tok/s warm). Using 0.6B for both classification and chat. Benchmark validates thinking mode suppression (`think:false`)
+- Ollama configured with `KEEP_ALIVE=-1`, `NUM_PARALLEL=2`, `CONTEXT_LENGTH=2048` — model stays warm from day 1
+- Set `presence_penalty: 1.5` and `"think": false` in Ollama request defaults for Qwen3 quantized models (the `/no_think` prompt prefix does not work with Ollama >= 0.15)
 - Gateway service (Express + `ws`) with WebSocket server — tenant ID on connection from day 1
 - TenantContext with `requestId` injected into every NATS message header (request tracing from day 1)
 - Structured JSON logging at every service hop with `requestId`, `service`, `event`, `ts`
@@ -829,13 +838,13 @@ This gives concrete evidence for "LangGraph improved classification accuracy fro
 | Risk | Impact | Mitigation |
 |---|---|---|
 | **Helm chart value overrides in `kind`** — bitnami charts have aggressive defaults (resource requests, persistence, auth) that don't fit a local cluster | Pods stuck in Pending, OOMKilled, or CrashLoopBackOff | Budget 2-4 hours for Helm values tuning. Start with `resources.requests/limits`, `auth.enabled=false`, `persistence.size=1Gi`. Test each chart individually before combining |
-| **Ollama model loading inside containers** — even CPU-only, Ollama inside Docker/kind can have issues with memory limits, `/tmp` space for model downloads, and slow initial pull | Models fail to load, Ollama pod OOMKilled during pull, 10+ minute initial setup | Set Ollama RAM limit generously (1.5 Gi) during initial pull, then tune down. Use `initContainer` or manual `ollama pull` after pod is running. Consider mounting a hostPath volume for model storage to survive pod restarts |
-| **Qwen3 actual performance differs from estimates** — CPU tok/s varies significantly by architecture (Intel vs. ARM, AVX support) | Latency budget assumptions invalid | Benchmark gate is mandatory. Have fallback model plan ready (see Model Selection table) |
+| **Ollama model loading inside containers** — Ollama inside Docker/kind runs without Metal acceleration on macOS ARM. Memory limits, KV cache allocation, and slow inference are all compounded | **Triggered.** 1.7B OOMKilled at up to 5 Gi limit; achieved only 0.5-0.9 tok/s when stable. 0.6B works at 2 Gi limit with 28-54 tok/s warm | Use single 0.6B model with 2 Gi limit. PVC for model persistence. `CONTEXT_LENGTH=2048` to reduce KV cache. All API calls use `think:false`. See [prompt-m1-04](docs/prompt-m1-04-ollama-deployment.md) for full memory tuning journey |
+| **Qwen3 actual performance differs from estimates** — CPU tok/s varies significantly by architecture (Intel vs. ARM, AVX support) and **virtualization layer** | **Triggered.** Docker Desktop eliminates Metal acceleration — 1.7B performance drops from estimated 25-45 tok/s to measured 0.5-0.9 tok/s | Benchmark gate activated. Using 0.6B for both roles. Upgrade path: run Ollama natively or increase Docker Desktop memory to >= 16 GB |
 | **`kind` networking** — services can't reach each other, Ingress controller missing, NodePort not exposed | WebSocket connection fails, services can't communicate | Install nginx Ingress controller via Helm. Use `kind` with `extraPortMappings` in cluster config. Test `curl` between pods before building services |
 
 ### M2: Hot Path (2-3 days)
 - Intent Router subscribing to NATS and routing messages per tenant subject
-- LLM Service calling Ollama: Qwen3 0.6B for intent classification (`/no_think` mode), Qwen3 1.7B for chat response — hand-rolled prompt construction, tenant-specific system prompts
+- LLM Service calling Ollama: Qwen3 0.6B for both intent classification (`think:false` mode) and chat response — hand-rolled prompt construction, tenant-specific system prompts
 - **Streaming at every hop:** Ollama → LLM Service → NATS → Response Composer → NATS → Gateway → WebSocket — each service forwards tokens on arrival, never buffers a full response
 - FAQ short-circuit: Intent Router routes FAQ intents directly to a static responder, bypassing the LLM entirely
 - Redis pipelining in Gateway: rate limit + cache check + session load in a single round-trip
@@ -850,7 +859,7 @@ This gives concrete evidence for "LangGraph improved classification accuracy fro
 |---|---|---|
 | **NATS client library differences** — nats.js (TypeScript services) and nats-py (Python services) have different streaming semantics, error handling, and reconnection behavior | Subtle bugs in cross-language message passing, token streaming | Build a minimal end-to-end test (publish from TypeScript, subscribe in Python) before integrating with real services. Test streaming specifically — single messages work fine, streaming token-by-token surfaces the differences |
 | **Token streaming through NATS** — publishing individual tokens as separate NATS messages creates high message volume; batching adds latency | Either too many messages (NATS overhead) or too much latency (batching) | Start with per-token messages (simplest). If NATS overhead is noticeable, batch 3-5 tokens per message as a tuning step. Measure with request tracing |
-| **Qwen3 thinking mode in classification** — if `/no_think` isn't correctly applied, the 0.6B model may produce verbose reasoning instead of a quick classification | Classification takes 2-5s instead of 200ms, breaking latency budget | Verify `/no_think` works with Qwen3 0.6B in isolation before integrating. Have a fallback: structured prompt that forces JSON-only response |
+| **Qwen3 thinking mode in classification** — `/no_think` prompt prefix does not work with Ollama >= 0.15; model ignores it and generates thinking tokens with empty response | **Triggered.** Classification produces empty responses with inflated eval_count if `/no_think` prompt prefix is used | Use `"think": false` API parameter in all Ollama requests. Benchmark gate validates this by checking for `thinking` field in responses. Resolved in M1-04 |
 
 ### M3: Cold Path + Context + LangGraph (2-3 days)
 - **Kafka migration:** Introduce Kafka (KRaft mode, single broker) via Helm chart. Migrate analytics pipeline from JetStream consumer to Kafka consumer. Document the migration: config complexity, consumer semantics, operational overhead, when Kafka wins

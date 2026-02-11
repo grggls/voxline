@@ -2,7 +2,8 @@ CLUSTER_NAME := voxline
 
 .PHONY: cluster-up cluster-down cluster-stop cluster-start cluster-status \
        foundations-up foundations-down foundations-status \
-       infra-up infra-down infra-status
+       infra-up infra-down infra-status \
+       ollama-up ollama-pull ollama-benchmark
 
 cluster-up:
 	@bash infra/kind/create-cluster.sh
@@ -73,3 +74,14 @@ infra-status:
 	@kubectl get pods -n voxline
 	@echo ""
 	@kubectl get pvc -n voxline
+
+# === Ollama (AI Model Runtime) ===
+
+ollama-up:
+	kubectl apply -f infra/k8s/ollama.yaml
+
+ollama-pull:
+	bash infra/k8s/ollama-pull-models.sh
+
+ollama-benchmark:
+	bash infra/k8s/ollama-benchmark.sh
