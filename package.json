@@ -1,0 +1,30 @@
+{
+  "name": "voxline",
+  "private": true,
+  "workspaces": [
+    "packages/*",
+    "gateway",
+    "echo-responder",
+    "intent-router",
+    "response-composer",
+    "tests"
+  ],
+  "scripts": {
+    "build": "npm run build --workspaces --if-present",
+    "test": "npm run test --workspaces --if-present",
+    "test:m1": "npm test -w tests -- --testPathPattern=m1/",
+    "lint": "eslint ."
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@nats-io/transport-node": "^3",
+    "@nats-io/jetstream": "^3"
+  },
+  "devDependencies": {
+    "typescript": "^5.9",
+    "eslint": "^9",
+    "typescript-eslint": "^8"
+  }
+}

@@ -1,0 +1,16 @@
+{
+  "name": "@voxline/shared",
+  "version": "0.1.0",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "test": "jest"
+  },
+  "devDependencies": {
+    "jest": "^29",
+    "ts-jest": "^29",
+    "@jest/globals": "^29",
+    "@types/jest": "^29"
+  }
+}

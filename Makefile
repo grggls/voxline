@@ -3,7 +3,8 @@ CLUSTER_NAME := voxline
 .PHONY: cluster-up cluster-down cluster-stop cluster-start cluster-status \
        foundations-up foundations-down foundations-status \
        infra-up infra-down infra-status \
-       ollama-up ollama-pull ollama-benchmark
+       ollama-up ollama-pull ollama-benchmark \
+       build test lint
 
 cluster-up:
 	@bash infra/kind/create-cluster.sh
@@ -85,3 +86,14 @@ ollama-pull:
 
 ollama-benchmark:
 	bash infra/k8s/ollama-benchmark.sh
+
+# === TypeScript Build, Test, Lint ===
+
+build:
+	npm run build
+
+test:
+	npm run test
+
+lint:
+	npm run lint

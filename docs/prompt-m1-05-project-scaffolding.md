@@ -363,13 +363,15 @@ describe('TenantContext NATS header round-trip', () => {
     "test": "jest"
   },
   "devDependencies": {
-    "jest": "^30",
-    "ts-jest": "^30",
-    "@jest/globals": "^30",
-    "@types/jest": "^30"
+    "jest": "^29",
+    "ts-jest": "^29",
+    "@jest/globals": "^29",
+    "@types/jest": "^29"
   }
 }
 ```
+
+> **Version note (implemented 2026-02-11):** Jest 30 is published but `ts-jest@^30` does not exist on npm yet. Using the `^29` family across all Jest-related packages for compatibility. Upgrade to `^30` when ts-jest publishes a matching major version.
 
 ### 10. `packages/shared/tsconfig.json`
 
