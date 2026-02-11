@@ -669,7 +669,7 @@ describe('M1 Smoke Tests', () => {
 
       expect(acme).toBeDefined();
       expect(acme!.config.rateLimit.maxPerMinute).toBeGreaterThan(0);
-      expect(acme!.config.llm.chatModel).toBe('qwen3:1.7b');
+      expect(acme!.config.llm.chatModel).toBe('qwen3:0.6b');
       expect(acme!.config.llm.classifyModel).toBe('qwen3:0.6b');
       expect(acme!.config.llm.systemPrompt).toBeTruthy();
     });
@@ -717,8 +717,8 @@ describe('M1 Smoke Tests', () => {
       const data = await res.json() as any;
       const modelNames = data.models.map((m: any) => m.name);
 
-      // Both models should be available
-      expect(modelNames.some((n: string) => n.includes('qwen3:0.6b') || n.includes('qwen3'))).toBe(true);
+      // Qwen3 0.6B should be available (single model for both classification and chat — M1-04 benchmark gate)
+      expect(modelNames.some((n: string) => n.includes('qwen3:0.6b'))).toBe(true);
     });
   });
 });

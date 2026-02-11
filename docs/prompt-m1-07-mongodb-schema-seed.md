@@ -64,7 +64,7 @@ db.tenants.updateOne(
       config: {
         rateLimit: { maxPerMinute: 60 },
         llm: {
-          chatModel: 'qwen3:1.7b',
+          chatModel: 'qwen3:0.6b',
           classifyModel: 'qwen3:0.6b',
           provider: 'ollama',
           systemPrompt: 'You are Acme Corp\'s support agent. You help customers with orders, returns, and general questions. Be concise and helpful.',
@@ -86,7 +86,7 @@ db.tenants.updateOne(
       config: {
         rateLimit: { maxPerMinute: 30 },
         llm: {
-          chatModel: 'qwen3:1.7b',
+          chatModel: 'qwen3:0.6b',
           classifyModel: 'qwen3:0.6b',
           provider: 'ollama',
           systemPrompt: 'You are Globex Inc\'s virtual assistant. You help employees with HR questions, IT support, and company policies. Be professional.',
@@ -108,7 +108,7 @@ db.tenants.updateOne(
       config: {
         rateLimit: { maxPerMinute: 10 },
         llm: {
-          chatModel: 'qwen3:1.7b',
+          chatModel: 'qwen3:0.6b',
           classifyModel: 'qwen3:0.6b',
           provider: 'ollama',
           systemPrompt: 'You are Initech\'s customer service bot. Help users with TPS reports and general office queries. Keep responses brief.',
@@ -190,7 +190,7 @@ These schemas document what services will write. The seed script creates the col
   timestamp: ISODate("2026-02-09T14:30:00Z"),
   createdAt: ISODate("2026-02-09T14:30:00Z"),
   metadata: {
-    model: "qwen3:1.7b",         // Which model generated (for assistant messages)
+    model: "qwen3:0.6b",         // Which model generated (for assistant messages)
     tokensGenerated: 45,
     ttftMs: 312,                  // Time to first token
     totalMs: 1450,                // Total generation time
