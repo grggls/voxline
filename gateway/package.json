@@ -1,0 +1,24 @@
+{
+  "name": "@voxline/gateway",
+  "version": "0.1.0",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsx src/index.ts"
+  },
+  "dependencies": {
+    "express": "^5.2",
+    "ws": "^8.16",
+    "@nats-io/transport-node": "^3.3",
+    "@nats-io/nats-core": "^3.3",
+    "mongodb": "^7.1",
+    "ioredis": "^5.3",
+    "@voxline/shared": "*"
+  },
+  "devDependencies": {
+    "@types/express": "^5",
+    "@types/ws": "^8",
+    "tsx": "^4.21",
+    "typescript": "^5.9"
+  }
+}

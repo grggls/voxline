@@ -4,6 +4,7 @@ CLUSTER_NAME := voxline
        foundations-up foundations-down foundations-status \
        infra-up infra-down infra-status \
        ollama-up ollama-pull ollama-benchmark \
+       gateway-build gateway-deploy \
        build test lint
 
 cluster-up:
@@ -86,6 +87,17 @@ ollama-pull:
 
 ollama-benchmark:
 	bash infra/k8s/ollama-benchmark.sh
+
+# === Gateway Service ===
+
+gateway-build:
+	docker build -t voxline/gateway:latest -f gateway/Dockerfile .
+	kind load docker-image voxline/gateway:latest --name voxline
+
+gateway-deploy: gateway-build
+	kubectl apply -f infra/k8s/gateway.yaml
+	kubectl rollout restart deployment/gateway -n voxline
+	kubectl rollout status deployment/gateway -n voxline --timeout=60s
 
 # === TypeScript Build, Test, Lint ===
 
